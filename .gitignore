@@ -1,0 +1,12 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Large model files (regenerate via scripts/convert_nllb_model.py)
+models/nllb-ct2/
+
+# Environment/secrets if you add any later
+.env

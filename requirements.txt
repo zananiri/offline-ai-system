@@ -1,0 +1,31 @@
+# requirements.txt — pinned 2026-07-16, verified live against PyPI
+# ------------------------------------------------------------------
+# Tier 1: version-critical (breaking changes are common) — pinned exact
+docling[rapidocr]==2.113.0
+docling-core==2.86.0
+ctranslate2==4.8.1
+ollama==0.6.2
+
+# Tier 2: used once, offline, for the NLLB conversion step only
+# (kept loose on purpose — these are never imported at runtime by the app,
+# only by scripts/convert_nllb_model.py — pinning them tightly just to
+# throw them away after conversion isn't worth the maintenance cost)
+transformers>=4.46,<5.0
+sentencepiece==0.2.0
+huggingface_hub>=0.27,<1.0
+
+# Tier 3: stable orchestration layer — floor pins, resolved exactly by setup.ps1
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.34,<1.0
+gradio>=5.9,<6.0
+python-multipart>=0.0.12
+
+# Tier 4: utilities
+py3langid==0.3.0          # lightweight offline language detection, no big model download
+python-docx>=1.2,<2.0     # loosened from an exact pin: docling 2.113.0 requires >=1.2.0
+pypandoc==1.13             # wraps the pandoc binary installed by setup.ps1
+pydantic>=2.9,<3.0
+
+# NOTE: setup.ps1 runs `pip freeze > requirements.lock.txt` after a clean
+# install. That lock file — not this one — is your real reproducibility
+# record, since fastapi/uvicorn/gradio move fast and this file only sets floors.
