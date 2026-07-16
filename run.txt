@@ -1,0 +1,6 @@
+cd C:\Users\iB\Projects\offline-ai-system
+.\.venv\Scripts\Activate.ps1
+
+cd C:\Users\iB\Projects\offline-ai-system
+.\.venv\Scripts\Activate.ps1
+python -m app.ui

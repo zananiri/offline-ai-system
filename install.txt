@@ -1,0 +1,31 @@
+Exact steps on the new computer
+1. Copy the project folder (via USB, network share, git, whatever — minus .venv/)
+2. Open PowerShell as Administrator in that folder, install system tools:
+powershellSet-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+winget install --id Python.Python.3.11 -e --source winget
+winget install --id Ollama.Ollama -e --source winget
+winget install --id JohnMacFarlane.Pandoc -e --source winget
+winget install --id UB-Mannheim.TesseractOCR -e --source winget
+3. Create a fresh venv and install from the lock file (this is exactly why I had setup.ps1 generate requirements.lock.txt — it's your reproducible source of truth):
+powershellpy -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.lock.txt
+4. Add the __init__.py if it didn't survive the copy (check app/__init__.py exists; if not, create an empty one).
+5. Start Ollama and pull the model (this downloads fresh on the new machine — the model isn't part of your project folder, it lives in Ollama's own storage):
+powershellollama serve
+New tab:
+powershell.\.venv\Scripts\Activate.ps1
+ollama pull qwen2.5:7b-instruct-q4_K_M
+6. Get the NLLB model onto the new machine:
+
+If you copied models/nllb-ct2/ already → skip this step entirely.
+If not:
+
+powershellpython scripts\convert_nllb_model.py
+7. Run it, same as before:
+powershelluvicorn app.main:app --host 0.0.0.0 --port 8000
+new tab:
+powershell.\.venv\Scripts\Activate.ps1
+python -m app.ui
+Steps 2–3 and 5–6 are the only genuinely new work — everything else is identical to first-time setup, just faster since you're not troubleshooting from scratch this time.
