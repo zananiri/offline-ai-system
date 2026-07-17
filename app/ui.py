@@ -3,10 +3,13 @@ Gradio UI — talks to the FastAPI backend at localhost:8000.
 Run after main.py is already running: python -m app.ui
 """
 import tempfile
+import zipfile
 from pathlib import Path
 
 import requests
 import gradio as gr
+import openpyxl
+from openpyxl.styles import Font
 
 from app.translate import LANGUAGES
 
@@ -93,6 +96,108 @@ def chat_fn(message, history):
 
 LOGO_PATH = "app/assets/logo.png"  # put your logo file here, any size — it's auto-resized below
 
+SUPPORTED_INVOICE_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+
+def process_invoices(zip_file, company_name, progress=gr.Progress()):
+    if zip_file is None:
+        return None, "Please upload a ZIP file first."
+
+    extract_dir = tempfile.mkdtemp()
+    try:
+        with zipfile.ZipFile(zip_file.name, "r") as zf:
+            zf.extractall(extract_dir)
+    except zipfile.BadZipFile:
+        return None, "That file doesn't look like a valid ZIP archive."
+
+    files = sorted(
+        p for p in Path(extract_dir).rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_INVOICE_EXTS
+    )
+    if not files:
+        return None, "No supported files (PDF/PNG/JPG/TIFF/BMP) found inside the ZIP."
+
+    sales_rows, expense_rows, unrecognized = [], [], []
+
+    for i, fpath in enumerate(files):
+        progress((i + 1) / len(files), desc=f"Processing {fpath.name} ({i + 1}/{len(files)})")
+        try:
+            with open(fpath, "rb") as f:
+                extract_resp = requests.post(f"{BACKEND_URL}/extract-text", files={"file": f})
+            extract_resp.raise_for_status()
+            markdown_text = extract_resp.json()["markdown"]
+
+            classify_resp = requests.post(
+                f"{BACKEND_URL}/classify-invoice",
+                json={"markdown": markdown_text, "filename": fpath.name, "company_name": company_name},
+            )
+            classify_resp.raise_for_status()
+            result = classify_resp.json()
+        except Exception:
+            unrecognized.append(fpath.name)
+            continue
+
+        doc_type = result.get("document_type", "unrecognized")
+        row = [
+            result.get("filename", fpath.name),
+            result.get("date", ""),
+            result.get("party_name", ""),
+            result.get("invoice_number", ""),
+            result.get("amount", 0),
+            result.get("currency", ""),
+        ]
+        if doc_type == "sales":
+            sales_rows.append(row)
+        elif doc_type == "expense":
+            expense_rows.append(row)
+        else:
+            unrecognized.append(fpath.name)
+
+    # --- Build the Excel report ---
+    progress(1.0, desc="Generating Excel report...")
+    headers = ["File", "Date", "Party", "Invoice #", "Amount", "Currency"]
+
+    wb = openpyxl.Workbook()
+    ws_sales = wb.active
+    ws_sales.title = "Sales"
+    ws_sales.append(headers)
+    for row in sales_rows:
+        ws_sales.append(row)
+
+    ws_expenses = wb.create_sheet("Expenses")
+    ws_expenses.append(headers)
+    for row in expense_rows:
+        ws_expenses.append(row)
+
+    for ws in (ws_sales, ws_expenses):
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+
+    if unrecognized:
+        ws_unrec = wb.create_sheet("Unrecognized")
+        ws_unrec.append(["Filename"])
+        for cell in ws_unrec[1]:
+            cell.font = Font(bold=True)
+        for name in unrecognized:
+            ws_unrec.append([name])
+
+    out_path = str(Path(tempfile.gettempdir()) / "accounting_report.xlsx")
+    wb.save(out_path)
+
+    total_sales = sum(r[4] for r in sales_rows if isinstance(r[4], (int, float)))
+    total_expenses = sum(r[4] for r in expense_rows if isinstance(r[4], (int, float)))
+
+    summary = (
+        f"Processed {len(files)} file(s): {len(sales_rows)} sales, "
+        f"{len(expense_rows)} expenses, {len(unrecognized)} unrecognized.\n"
+        f"Total sales: {total_sales} | Total expenses: {total_expenses}"
+    )
+    if unrecognized:
+        summary += "\n\nNot recognized (check these manually):\n" + "\n".join(f"- {n}" for n in unrecognized)
+
+    return out_path, summary
+
+
 with gr.Blocks(title="Your Company Name — Offline Translator") as demo:
     with gr.Row():
         gr.Image(
@@ -132,6 +237,28 @@ with gr.Blocks(title="Your Company Name — Offline Translator") as demo:
                     "and ask questions about it — text (with OCR if needed) is extracted "
                     "and given to the model as context.")
         gr.ChatInterface(fn=chat_fn, type="messages", multimodal=True)
+
+    with gr.Tab("Accountant"):
+        gr.Markdown(
+            "Upload a ZIP file containing scans of sales invoices and expense receipts "
+            "(PDF, PNG, JPG, TIFF, BMP). Each document is OCR'd and classified as a "
+            "sale or an expense, and an Excel report is generated with both broken out "
+            "on separate sheets."
+        )
+        company_name_in = gr.Textbox(
+            label="Your company/business name",
+            placeholder="e.g. Acme Corp — helps tell sales invoices from expense invoices",
+        )
+        zip_in = gr.File(label="Upload ZIP of invoice/receipt scans", file_types=[".zip"])
+        process_btn = gr.Button("Process Invoices", variant="primary")
+        report_out = gr.File(label="Download Excel Report")
+        summary_out = gr.Textbox(label="Summary / Documents not recognized", lines=10)
+
+        process_btn.click(
+            process_invoices,
+            inputs=[zip_in, company_name_in],
+            outputs=[report_out, summary_out],
+        )
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)

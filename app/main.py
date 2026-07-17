@@ -32,6 +32,54 @@ def detect_language(text: str = Form(...)):
     return {"iso_639_1": code}
 
 
+import json
+
+@app.post("/classify-invoice")
+async def classify_invoice(payload: dict):
+    """
+    Classifies OCR-extracted invoice/receipt text as sales or expense and
+    extracts key fields. Returns document_type="unrecognized" if the model
+    can't confidently classify it or the text isn't an invoice/receipt at all.
+    """
+    markdown_text = payload.get("markdown", "")
+    filename = payload.get("filename", "")
+    company_name = payload.get("company_name", "").strip()
+
+    system_prompt = (
+        "You are an accounting assistant. You are given OCR-extracted text from a "
+        "scanned invoice or receipt. Classify it and extract key fields. "
+        "Respond with ONLY valid JSON, no other text, in exactly this shape:\n"
+        '{"document_type": "sales" | "expense" | "unrecognized", '
+        '"party_name": string, "invoice_number": string, "date": string, '
+        '"amount": number, "currency": string}\n\n'
+        f"The business being accounted for is: {company_name or '(not specified - infer from context)'}. "
+        "Classify as \"sales\" if this business is the SELLER/issuer of the invoice (money coming in). "
+        "Classify as \"expense\" if this business is the BUYER/recipient (money going out). "
+        "If the text is unreadable, doesn't look like an invoice or receipt, or you cannot "
+        "determine the type or amount with reasonable confidence, use \"unrecognized\" and "
+        "leave the other fields empty or 0."
+    )
+
+    try:
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            format="json",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": markdown_text[:4000]},
+            ],
+        )
+        result = json.loads(response["message"]["content"])
+        if result.get("document_type") not in ("sales", "expense", "unrecognized"):
+            result["document_type"] = "unrecognized"
+    except Exception:
+        result = {"document_type": "unrecognized", "party_name": "", "invoice_number": "",
+                   "date": "", "amount": 0, "currency": ""}
+
+    result["filename"] = filename
+    return result
+
+
 @app.post("/extract-text")
 async def extract_text(file: UploadFile = File(...)):
     """
