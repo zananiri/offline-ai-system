@@ -93,7 +93,7 @@ def chat_fn(message, history):
 
 LOGO_PATH = "app/assets/logo.png"  # put your logo file here, any size — it's auto-resized below
 
-with gr.Blocks(title="LPJ — Offline Translator") as demo:
+with gr.Blocks(title="Your Company Name — Offline Translator") as demo:
     with gr.Row():
         gr.Image(
             value=LOGO_PATH,
@@ -102,8 +102,11 @@ with gr.Blocks(title="LPJ — Offline Translator") as demo:
             height=60,
             width=60,
             scale=0,
+            show_fullscreen_button=False,
+            show_download_button=False,
+            interactive=False,
         )
-        gr.Markdown("# Latin Patriarchate of Jerusalem\n### Offline Document Translator + Converter")
+        gr.Markdown("# Your Company Name\n### Offline Document Translator + Converter")
 
     with gr.Tab("Translate"):
         file_in = gr.File(label="Upload document (PDF, DOCX, PPTX, image)")
