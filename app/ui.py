@@ -12,31 +12,61 @@ import openpyxl
 from openpyxl.styles import Font
 
 from app.translate import LANGUAGES
+from app.document import chunk_text
 
 BACKEND_URL = "http://localhost:8000"
 
 
-def process(file, source_lang, target_lang, summarize):
+def process(file, source_lang, target_lang, summarize, progress=gr.Progress()):
+    progress(0, desc="Extracting text from document (OCR if needed)...")
     with open(file.name, "rb") as f:
+        extract_resp = requests.post(f"{BACKEND_URL}/extract-text", files={"file": f})
+    extract_resp.raise_for_status()
+    markdown_text = extract_resp.json()["markdown"]
+
+    chunks = chunk_text(markdown_text)
+    if not chunks:
+        return "(no text found in document)", "(not requested)"
+
+    total_steps = len(chunks) + (1 if summarize else 0)
+    translated_chunks = []
+    for i, chunk in enumerate(chunks):
+        progress((i + 1) / total_steps, desc=f"Translating chunk {i + 1}/{len(chunks)}...")
         resp = requests.post(
-            f"{BACKEND_URL}/translate-document",
-            files={"file": f},
-            data={"source_lang": source_lang, "target_lang": target_lang, "summarize": summarize},
+            f"{BACKEND_URL}/translate-chunk",
+            json={"text": chunk, "source_lang": source_lang, "target_lang": target_lang},
         )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["translated_text"], data.get("summary") or "(not requested)"
+        resp.raise_for_status()
+        translated_chunks.append(resp.json()["translated"])
+
+    translated_text = "\n\n".join(translated_chunks)
+
+    summary = "(not requested)"
+    if summarize:
+        progress(1.0, desc="Summarizing with AI...")
+        messages = [
+            {"role": "system", "content": "You are a precise document summarizer."},
+            {"role": "user", "content": f"Summarize this in 3-5 bullet points:\n\n{translated_text}"},
+        ]
+        resp = requests.post(f"{BACKEND_URL}/chat", json={"messages": messages})
+        resp.raise_for_status()
+        summary = resp.json()["content"]
+
+    return translated_text, summary
 
 
-def convert_to_word(file):
+def convert_to_word(file, progress=gr.Progress()):
+    progress(0.15, desc="Extracting text (running OCR if needed)...")
     with open(file.name, "rb") as f:
         resp = requests.post(f"{BACKEND_URL}/convert-to-word", files={"file": f})
     resp.raise_for_status()
+    progress(0.9, desc="Saving Word document...")
 
     out_name = Path(file.name).stem + ".docx"
     out_path = str(Path(tempfile.gettempdir()) / out_name)
     with open(out_path, "wb") as out_f:
         out_f.write(resp.content)
+    progress(1.0, desc="Done")
     return out_path
 
 
@@ -198,7 +228,7 @@ def process_invoices(zip_file, company_name, progress=gr.Progress()):
     return out_path, summary
 
 
-with gr.Blocks(title="Your Company Name — Offline Translator") as demo:
+with gr.Blocks(title="Latin Patriarchate of Jerusalem - LPJ") as demo:
     with gr.Row():
         gr.Image(
             value=LOGO_PATH,
@@ -211,14 +241,14 @@ with gr.Blocks(title="Your Company Name — Offline Translator") as demo:
             show_download_button=False,
             interactive=False,
         )
-        gr.Markdown("# Your Company Name\n### Offline Document Translator + Converter")
+        gr.Markdown("# Latin Patrairachate of Jerusalem - LPJ\n### Offline Document Translator + Converter")
 
     with gr.Tab("Translate"):
         file_in = gr.File(label="Upload document (PDF, DOCX, PPTX, image)")
         with gr.Row():
             src = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Source language", value="english")
             tgt = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Target language", value="spanish")
-            summarize = gr.Checkbox(label="Also summarize with Ollama")
+            summarize = gr.Checkbox(label="Also summarize with AI")
         run_btn = gr.Button("Translate")
         output_text = gr.Textbox(label="Translated text", lines=20)
         output_summary = gr.Textbox(label="Summary (if requested)", lines=5)

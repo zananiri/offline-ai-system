@@ -129,6 +129,17 @@ async def convert_to_word(file: UploadFile = File(...)):
     )
 
 
+@app.post("/translate-chunk")
+async def translate_chunk(payload: dict):
+    """Translates a single chunk of text. Used by the UI to show per-chunk progress."""
+    text = payload.get("text", "")
+    source_lang = payload.get("source_lang")
+    target_lang = payload.get("target_lang")
+    translator = get_translator()
+    translated = translator.translate(text, source_lang, target_lang)
+    return {"translated": translated}
+
+
 @app.post("/translate-document")
 async def translate_document(
     file: UploadFile = File(...),
