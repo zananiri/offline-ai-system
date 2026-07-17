@@ -10,6 +10,7 @@ import requests
 import gradio as gr
 import openpyxl
 from openpyxl.styles import Font
+from pypdf import PdfReader, PdfWriter
 
 from app.translate import LANGUAGES
 from app.document import chunk_text
@@ -43,7 +44,7 @@ def process(file, source_lang, target_lang, summarize, progress=gr.Progress()):
 
     summary = "(not requested)"
     if summarize:
-        progress(1.0, desc="Summarizing with AI...")
+        progress(1.0, desc="Summarizing with Ollama...")
         messages = [
             {"role": "system", "content": "You are a precise document summarizer."},
             {"role": "user", "content": f"Summarize this in 3-5 bullet points:\n\n{translated_text}"},
@@ -129,23 +130,59 @@ LOGO_PATH = "app/assets/logo.png"  # put your logo file here, any size — it's 
 SUPPORTED_INVOICE_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
-def process_invoices(zip_file, company_name, progress=gr.Progress()):
-    if zip_file is None:
-        return None, "Please upload a ZIP file first."
+def split_pdf_to_pages(pdf_path, output_dir):
+    """Splits a multi-page PDF into one single-page PDF per page, so each
+    page is later OCR'd/classified as its own separate document."""
+    reader = PdfReader(str(pdf_path))
+    base_name = Path(pdf_path).stem
+    page_paths = []
+    for i, page in enumerate(reader.pages):
+        writer = PdfWriter()
+        writer.add_page(page)
+        out_path = Path(output_dir) / f"{base_name}_page{i + 1}.pdf"
+        with open(out_path, "wb") as f:
+            writer.write(f)
+        page_paths.append(out_path)
+    return page_paths
 
-    extract_dir = tempfile.mkdtemp()
-    try:
-        with zipfile.ZipFile(zip_file.name, "r") as zf:
-            zf.extractall(extract_dir)
-    except zipfile.BadZipFile:
-        return None, "That file doesn't look like a valid ZIP archive."
 
-    files = sorted(
-        p for p in Path(extract_dir).rglob("*")
-        if p.is_file() and p.suffix.lower() in SUPPORTED_INVOICE_EXTS
-    )
+def expand_pdfs_to_pages(files, work_dir):
+    """Given a mixed list of files, splits every PDF into per-page PDFs
+    and leaves image files untouched (they're already single-page)."""
+    expanded = []
+    for f in files:
+        if f.suffix.lower() == ".pdf":
+            expanded.extend(split_pdf_to_pages(f, work_dir))
+        else:
+            expanded.append(f)
+    return expanded
+
+
+def process_invoices(uploaded_file, company_name, progress=gr.Progress()):
+    if uploaded_file is None:
+        return None, "Please upload a ZIP or PDF file first."
+
+    work_dir = tempfile.mkdtemp()
+    suffix = Path(uploaded_file.name).suffix.lower()
+
+    if suffix == ".zip":
+        try:
+            with zipfile.ZipFile(uploaded_file.name, "r") as zf:
+                zf.extractall(work_dir)
+        except zipfile.BadZipFile:
+            return None, "That file doesn't look like a valid ZIP archive."
+        raw_files = sorted(
+            p for p in Path(work_dir).rglob("*")
+            if p.is_file() and p.suffix.lower() in SUPPORTED_INVOICE_EXTS
+        )
+        files = expand_pdfs_to_pages(raw_files, work_dir)
+    elif suffix == ".pdf":
+        files = split_pdf_to_pages(Path(uploaded_file.name), work_dir)
+    else:
+        return None, f"Unsupported file type '{suffix}'. Upload a .zip or a .pdf."
+
     if not files:
-        return None, "No supported files (PDF/PNG/JPG/TIFF/BMP) found inside the ZIP."
+        return None, "No supported files/pages found."
 
     sales_rows, expense_rows, unrecognized = [], [], []
 
@@ -174,6 +211,7 @@ def process_invoices(zip_file, company_name, progress=gr.Progress()):
             result.get("party_name", ""),
             result.get("invoice_number", ""),
             result.get("amount", 0),
+            result.get("vat", 0),
             result.get("currency", ""),
         ]
         if doc_type == "sales":
@@ -185,7 +223,7 @@ def process_invoices(zip_file, company_name, progress=gr.Progress()):
 
     # --- Build the Excel report ---
     progress(1.0, desc="Generating Excel report...")
-    headers = ["File", "Date", "Party", "Invoice #", "Amount", "Currency"]
+    headers = ["File", "Date", "Party", "Invoice #", "Total", "VAT", "Currency"]
 
     wb = openpyxl.Workbook()
     ws_sales = wb.active
@@ -216,11 +254,14 @@ def process_invoices(zip_file, company_name, progress=gr.Progress()):
 
     total_sales = sum(r[4] for r in sales_rows if isinstance(r[4], (int, float)))
     total_expenses = sum(r[4] for r in expense_rows if isinstance(r[4], (int, float)))
+    total_sales_vat = sum(r[5] for r in sales_rows if isinstance(r[5], (int, float)))
+    total_expenses_vat = sum(r[5] for r in expense_rows if isinstance(r[5], (int, float)))
 
     summary = (
-        f"Processed {len(files)} file(s): {len(sales_rows)} sales, "
+        f"Processed {len(files)} page(s)/file(s): {len(sales_rows)} sales, "
         f"{len(expense_rows)} expenses, {len(unrecognized)} unrecognized.\n"
-        f"Total sales: {total_sales} | Total expenses: {total_expenses}"
+        f"Total sales: {total_sales} (VAT: {total_sales_vat}) | "
+        f"Total expenses: {total_expenses} (VAT: {total_expenses_vat})"
     )
     if unrecognized:
         summary += "\n\nNot recognized (check these manually):\n" + "\n".join(f"- {n}" for n in unrecognized)
@@ -228,7 +269,7 @@ def process_invoices(zip_file, company_name, progress=gr.Progress()):
     return out_path, summary
 
 
-with gr.Blocks(title="Latin Patriarchate of Jerusalem - LPJ") as demo:
+with gr.Blocks(title="Latin Patriarchate of Jerusalem — Offline Translator") as demo:
     with gr.Row():
         gr.Image(
             value=LOGO_PATH,
@@ -241,14 +282,14 @@ with gr.Blocks(title="Latin Patriarchate of Jerusalem - LPJ") as demo:
             show_download_button=False,
             interactive=False,
         )
-        gr.Markdown("# Latin Patrairachate of Jerusalem - LPJ\n### Offline Document Translator + Converter")
+        gr.Markdown("# Latin Patriarchate of Jerusalem \n### LPJ AI Employee")
 
     with gr.Tab("Translate"):
         file_in = gr.File(label="Upload document (PDF, DOCX, PPTX, image)")
         with gr.Row():
             src = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Source language", value="english")
             tgt = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Target language", value="spanish")
-            summarize = gr.Checkbox(label="Also summarize with AI")
+            summarize = gr.Checkbox(label="Summarize with AI")
         run_btn = gr.Button("Translate")
         output_text = gr.Textbox(label="Translated text", lines=20)
         output_summary = gr.Textbox(label="Summary (if requested)", lines=5)
@@ -270,16 +311,20 @@ with gr.Blocks(title="Latin Patriarchate of Jerusalem - LPJ") as demo:
 
     with gr.Tab("Accountant"):
         gr.Markdown(
-            "Upload a ZIP file containing scans of sales invoices and expense receipts "
-            "(PDF, PNG, JPG, TIFF, BMP). Each document is OCR'd and classified as a "
-            "sale or an expense, and an Excel report is generated with both broken out "
-            "on separate sheets."
+            "Upload a **ZIP** or a **PDF** containing scans of sales invoices and expense "
+            "receipts (PDF pages, PNG, JPG, TIFF, BMP). Each page/file is OCR'd and "
+            "classified independently as a sale or an expense, and an Excel report is "
+            "generated with both broken out on separate sheets, including totals and VAT.\n\n"
+            "⚠️ **Each page must contain exactly one invoice or receipt.** Multi-page "
+            "invoices (a single invoice spanning 2+ pages) are not supported — every "
+            "page is treated as its own separate document, so a multi-page invoice will "
+            "be split and counted incorrectly."
         )
         company_name_in = gr.Textbox(
             label="Your company/business name",
             placeholder="e.g. Acme Corp — helps tell sales invoices from expense invoices",
         )
-        zip_in = gr.File(label="Upload ZIP of invoice/receipt scans", file_types=[".zip"])
+        zip_in = gr.File(label="Upload ZIP or PDF of invoice/receipt scans", file_types=[".zip", ".pdf"])
         process_btn = gr.Button("Process Invoices", variant="primary")
         report_out = gr.File(label="Download Excel Report")
         summary_out = gr.Textbox(label="Summary / Documents not recognized", lines=10)

@@ -4,6 +4,7 @@ FastAPI orchestrator.
 Pipeline: upload -> Docling (convert+OCR) -> language detect -> NLLB translate
           -> optional Ollama cleanup/summarization -> return / export docx
 """
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -32,8 +33,6 @@ def detect_language(text: str = Form(...)):
     return {"iso_639_1": code}
 
 
-import json
-
 @app.post("/classify-invoice")
 async def classify_invoice(payload: dict):
     """
@@ -51,7 +50,10 @@ async def classify_invoice(payload: dict):
         "Respond with ONLY valid JSON, no other text, in exactly this shape:\n"
         '{"document_type": "sales" | "expense" | "unrecognized", '
         '"party_name": string, "invoice_number": string, "date": string, '
-        '"amount": number, "currency": string}\n\n'
+        '"amount": number, "vat": number, "currency": string}\n\n'
+        "\"amount\" is the total amount on the invoice (including tax/VAT if shown). "
+        "\"vat\" is the VAT/tax amount shown on the invoice as a number; use 0 if no "
+        "VAT/tax line is present or the invoice is not VAT-registered. "
         f"The business being accounted for is: {company_name or '(not specified - infer from context)'}. "
         "Classify as \"sales\" if this business is the SELLER/issuer of the invoice (money coming in). "
         "Classify as \"expense\" if this business is the BUYER/recipient (money going out). "
@@ -74,7 +76,7 @@ async def classify_invoice(payload: dict):
             result["document_type"] = "unrecognized"
     except Exception:
         result = {"document_type": "unrecognized", "party_name": "", "invoice_number": "",
-                   "date": "", "amount": 0, "currency": ""}
+                   "date": "", "amount": 0, "vat": 0, "currency": ""}
 
     result["filename"] = filename
     return result
