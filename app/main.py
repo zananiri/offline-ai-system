@@ -11,9 +11,9 @@ from pathlib import Path
 import ollama
 import py3langid as langid
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
-from app.document import convert_to_markdown, chunk_text
+from app.document import convert_to_markdown, chunk_text, convert_file_to_docx
 from app.translate import get_translator, LANGUAGES
 
 app = FastAPI(title="Offline Translator + Document OCR")
@@ -30,6 +30,55 @@ def health():
 def detect_language(text: str = Form(...)):
     code, _ = langid.classify(text)
     return {"iso_639_1": code}
+
+
+@app.post("/extract-text")
+async def extract_text(file: UploadFile = File(...)):
+    """
+    Extracts Markdown text from any supported document (PDF, DOCX, PPTX, image via OCR)
+    without exporting to Word. Used by the chat tab to give the model file context.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    markdown_text = convert_to_markdown(tmp_path)
+    return {"filename": file.filename, "markdown": markdown_text}
+
+
+@app.post("/chat")
+async def chat(payload: dict):
+    """
+    General chat endpoint backed by Ollama.
+    Expects: {"messages": [{"role": "user"|"assistant"|"system", "content": "..."}]}
+    """
+    messages = payload.get("messages", [])
+    response = ollama.chat(model=OLLAMA_MODEL, messages=messages)
+    return {"content": response["message"]["content"]}
+
+
+@app.post("/convert-to-word")
+async def convert_to_word(file: UploadFile = File(...)):
+    """
+    Converts PDF -> Word, or an image (via OCR) -> Word.
+    Docling auto-detects the input type; scanned PDFs and images both
+    go through its OCR path, native PDFs go through direct text extraction.
+    """
+    suffix = Path(file.filename).suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_in:
+        shutil.copyfileobj(file.file, tmp_in)
+        input_path = tmp_in.name
+
+    output_filename = Path(file.filename).stem + ".docx"
+    output_path = str(Path(tempfile.gettempdir()) / output_filename)
+
+    convert_file_to_docx(input_path, output_path)
+
+    return FileResponse(
+        output_path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=output_filename,
+    )
 
 
 @app.post("/translate-document")
