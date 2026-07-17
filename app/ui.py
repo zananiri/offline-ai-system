@@ -304,7 +304,7 @@ with gr.Blocks(title="Latin Patriarchate of Jerusalem — Offline Translator") a
         convert_btn.click(convert_to_word, inputs=[convert_file_in], outputs=[convert_output])
 
     with gr.Tab("Chat"):
-        gr.Markdown("Chat with the local Ollama model. Attach a PDF, DOCX, PPTX, or image "
+        gr.Markdown("Chat with the local AI model. Attach a PDF, DOCX, PPTX, or image "
                     "and ask questions about it — text (with OCR if needed) is extracted "
                     "and given to the model as context.")
         gr.ChatInterface(fn=chat_fn, type="messages", multimodal=True)
