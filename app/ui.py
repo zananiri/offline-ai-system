@@ -18,16 +18,23 @@ from app.document import chunk_text
 BACKEND_URL = "http://localhost:8000"
 
 
-def process(file, source_lang, target_lang, summarize, progress=gr.Progress()):
+def process(file, source_lang, target_lang, summarize, hebrew_doc, progress=gr.Progress()):
+    # Deterministic mapping already enforced in document.py: hebrew=True
+    # always routes through Tesseract, hebrew=False through RapidOCR — so
+    # this can be reported directly without a round trip to the backend.
+    ocr_engine = "Tesseract (Hebrew)" if hebrew_doc else "RapidOCR (default)"
+
     progress(0, desc="Extracting text from document (OCR if needed)...")
     with open(file.name, "rb") as f:
-        extract_resp = requests.post(f"{BACKEND_URL}/extract-text", files={"file": f})
+        extract_resp = requests.post(
+            f"{BACKEND_URL}/extract-text", files={"file": f}, data={"hebrew": hebrew_doc}
+        )
     extract_resp.raise_for_status()
     markdown_text = extract_resp.json()["markdown"]
 
     chunks = chunk_text(markdown_text)
     if not chunks:
-        return "(no text found in document)", "(not requested)"
+        return "(no text found in document)", ocr_engine, "(not requested)"
 
     total_steps = len(chunks) + (1 if summarize else 0)
     translated_chunks = []
@@ -44,7 +51,7 @@ def process(file, source_lang, target_lang, summarize, progress=gr.Progress()):
 
     summary = "(not requested)"
     if summarize:
-        progress(1.0, desc="Summarizing with Ollama...")
+        progress(1.0, desc="Summarizing with AI...")
         messages = [
             {"role": "system", "content": "You are a precise document summarizer."},
             {"role": "user", "content": f"Summarize this in 3-5 bullet points:\n\n{translated_text}"},
@@ -53,13 +60,15 @@ def process(file, source_lang, target_lang, summarize, progress=gr.Progress()):
         resp.raise_for_status()
         summary = resp.json()["content"]
 
-    return translated_text, summary
+    return translated_text, ocr_engine, summary
 
 
-def convert_to_word(file, progress=gr.Progress()):
+def convert_to_word(file, hebrew_doc, progress=gr.Progress()):
     progress(0.15, desc="Extracting text (running OCR if needed)...")
     with open(file.name, "rb") as f:
-        resp = requests.post(f"{BACKEND_URL}/convert-to-word", files={"file": f})
+        resp = requests.post(
+            f"{BACKEND_URL}/convert-to-word", files={"file": f}, data={"hebrew": hebrew_doc}
+        )
     resp.raise_for_status()
     progress(0.9, desc="Saving Word document...")
 
@@ -74,21 +83,24 @@ def convert_to_word(file, progress=gr.Progress()):
 MAX_CONTEXT_CHARS = 6000  # keep injected document text within the model's comfortable context window
 
 
-def extract_context_from_files(filepaths):
+def extract_context_from_files(filepaths, hebrew=False):
     contexts = []
     for path in filepaths:
         with open(path, "rb") as f:
-            resp = requests.post(f"{BACKEND_URL}/extract-text", files={"file": f})
+            resp = requests.post(
+                f"{BACKEND_URL}/extract-text", files={"file": f}, data={"hebrew": hebrew}
+            )
         resp.raise_for_status()
         data = resp.json()
         contexts.append(f"--- Content of {Path(path).name} ---\n{data['markdown']}")
     return "\n\n".join(contexts)
 
 
-def chat_fn(message, history):
+def chat_fn(message, history, hebrew_doc=False):
     """
     message is a dict {"text": str, "files": [filepaths]} because the
-    ChatInterface below is configured with multimodal=True.
+    ChatInterface below is configured with multimodal=True. hebrew_doc
+    comes from the additional_inputs checkbox added to the ChatInterface.
     """
     if isinstance(message, dict):
         user_text = message.get("text", "")
@@ -99,7 +111,7 @@ def chat_fn(message, history):
 
     file_context = ""
     if files:
-        file_context = extract_context_from_files(files)
+        file_context = extract_context_from_files(files, hebrew=hebrew_doc)
         if len(file_context) > MAX_CONTEXT_CHARS:
             file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
 
@@ -123,6 +135,27 @@ def chat_fn(message, history):
     resp = requests.post(f"{BACKEND_URL}/chat", json={"messages": messages})
     resp.raise_for_status()
     return resp.json()["content"]
+
+
+def set_hebrew_from_source_lang(source_lang):
+    """
+    Fires on the Translate tab's Source language dropdown. Hebrew/Tesseract
+    routing is now fully automatic — there's no checkbox for the user to
+    manage. Returns (is_hebrew, status_markdown_update).
+
+    NOTE: assumes the LANGUAGES dict in app/translate.py uses the key
+    "hebrew" (matching the lowercase convention "english"/"spanish" already
+    used as defaults below) — double check that key against translate.py if
+    this doesn't trigger correctly.
+    """
+    is_hebrew = (source_lang or "").strip().lower() == "hebrew"
+    if is_hebrew:
+        return True, gr.update(
+            value="🔤 **Hebrew selected — Tesseract OCR will be used automatically** "
+                  "(the only engine here with Hebrew support).",
+            visible=True,
+        )
+    return False, gr.update(value="", visible=False)
 
 
 LOGO_PATH = "app/assets/logo.png"  # put your logo file here, any size — it's auto-resized below
@@ -158,7 +191,7 @@ def expand_pdfs_to_pages(files, work_dir):
     return expanded
 
 
-def process_invoices(uploaded_file, company_name, progress=gr.Progress()):
+def process_invoices(uploaded_file, company_name, hebrew_batch, progress=gr.Progress()):
     if uploaded_file is None:
         return None, "Please upload a ZIP or PDF file first."
 
@@ -190,7 +223,9 @@ def process_invoices(uploaded_file, company_name, progress=gr.Progress()):
         progress((i + 1) / len(files), desc=f"Processing {fpath.name} ({i + 1}/{len(files)})")
         try:
             with open(fpath, "rb") as f:
-                extract_resp = requests.post(f"{BACKEND_URL}/extract-text", files={"file": f})
+                extract_resp = requests.post(
+                    f"{BACKEND_URL}/extract-text", files={"file": f}, data={"hebrew": hebrew_batch}
+                )
             extract_resp.raise_for_status()
             markdown_text = extract_resp.json()["markdown"]
 
@@ -269,7 +304,7 @@ def process_invoices(uploaded_file, company_name, progress=gr.Progress()):
     return out_path, summary
 
 
-with gr.Blocks(title="Latin Patriarchate of Jerusalem — Offline Translator") as demo:
+with gr.Blocks(title=" Ibrahim - AI Employee") as demo:
     with gr.Row():
         gr.Image(
             value=LOGO_PATH,
@@ -282,32 +317,55 @@ with gr.Blocks(title="Latin Patriarchate of Jerusalem — Offline Translator") a
             show_download_button=False,
             interactive=False,
         )
-        gr.Markdown("# Latin Patriarchate of Jerusalem \n### LPJ AI Employee")
+        gr.Markdown("# Ibrahim - AI Employee \n### Multi Purpose AI Agent")
 
     with gr.Tab("Translate"):
         file_in = gr.File(label="Upload document (PDF, DOCX, PPTX, image)")
         with gr.Row():
             src = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Source language", value="english")
             tgt = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Target language", value="spanish")
-            summarize = gr.Checkbox(label="Summarize with AI")
+            summarize = gr.Checkbox(label="Also summarize with AI")
+        hebrew_doc_translate = gr.State(value=False)
+        hebrew_status_translate = gr.Markdown(value="", visible=False)
+        src.change(
+            set_hebrew_from_source_lang,
+            inputs=[src],
+            outputs=[hebrew_doc_translate, hebrew_status_translate],
+        )
         run_btn = gr.Button("Translate")
         output_text = gr.Textbox(label="Translated text", lines=20)
+        ocr_engine_out = gr.Textbox(label="OCR engine (used if the document needed OCR)", interactive=False)
         output_summary = gr.Textbox(label="Summary (if requested)", lines=5)
-        run_btn.click(process, inputs=[file_in, src, tgt, summarize], outputs=[output_text, output_summary])
+        run_btn.click(
+            process,
+            inputs=[file_in, src, tgt, summarize, hebrew_doc_translate],
+            outputs=[output_text, ocr_engine_out, output_summary],
+        )
 
     with gr.Tab("Convert to Word"):
         gr.Markdown("Upload a PDF (native or scanned) or an image — text is extracted "
                     "(with OCR if needed) and exported as a .docx file.")
         convert_file_in = gr.File(label="Upload PDF or image")
+        hebrew_doc_convert = gr.Checkbox(
+            label="Document is in Hebrew (uses Tesseract OCR instead of the default engine)"
+        )
         convert_btn = gr.Button("Convert to Word")
         convert_output = gr.File(label="Download .docx")
-        convert_btn.click(convert_to_word, inputs=[convert_file_in], outputs=[convert_output])
+        convert_btn.click(
+            convert_to_word, inputs=[convert_file_in, hebrew_doc_convert], outputs=[convert_output]
+        )
 
     with gr.Tab("Chat"):
         gr.Markdown("Chat with the local AI model. Attach a PDF, DOCX, PPTX, or image "
                     "and ask questions about it — text (with OCR if needed) is extracted "
                     "and given to the model as context.")
-        gr.ChatInterface(fn=chat_fn, type="messages", multimodal=True)
+        chat_hebrew_checkbox = gr.Checkbox(
+            label="Attached document is in Hebrew (uses Tesseract OCR instead of the default engine)"
+        )
+        gr.ChatInterface(
+            fn=chat_fn, type="messages", multimodal=True,
+            additional_inputs=[chat_hebrew_checkbox],
+        )
 
     with gr.Tab("Accountant"):
         gr.Markdown(
@@ -318,20 +376,26 @@ with gr.Blocks(title="Latin Patriarchate of Jerusalem — Offline Translator") a
             "⚠️ **Each page must contain exactly one invoice or receipt.** Multi-page "
             "invoices (a single invoice spanning 2+ pages) are not supported — every "
             "page is treated as its own separate document, so a multi-page invoice will "
-            "be split and counted incorrectly."
+            "be split and counted incorrectly.\n\n"
+            "⚠️ **The Hebrew checkbox applies to the whole batch.** If a single ZIP mixes "
+            "Hebrew and non-Hebrew documents, process them in two separate batches for "
+            "best accuracy."
         )
         company_name_in = gr.Textbox(
-            label="Your company/business name",
+            label="Ibrahim - AI Employee",
             placeholder="e.g. Acme Corp — helps tell sales invoices from expense invoices",
         )
         zip_in = gr.File(label="Upload ZIP or PDF of invoice/receipt scans", file_types=[".zip", ".pdf"])
+        hebrew_batch_in = gr.Checkbox(
+            label="These documents are in Hebrew (uses Tesseract OCR instead of the default engine)"
+        )
         process_btn = gr.Button("Process Invoices", variant="primary")
         report_out = gr.File(label="Download Excel Report")
         summary_out = gr.Textbox(label="Summary / Documents not recognized", lines=10)
 
         process_btn.click(
             process_invoices,
-            inputs=[zip_in, company_name_in],
+            inputs=[zip_in, company_name_in, hebrew_batch_in],
             outputs=[report_out, summary_out],
         )
 

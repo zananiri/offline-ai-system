@@ -83,16 +83,17 @@ async def classify_invoice(payload: dict):
 
 
 @app.post("/extract-text")
-async def extract_text(file: UploadFile = File(...)):
+async def extract_text(file: UploadFile = File(...), hebrew: bool = Form(False)):
     """
     Extracts Markdown text from any supported document (PDF, DOCX, PPTX, image via OCR)
     without exporting to Word. Used by the chat tab to give the model file context.
+    Set hebrew=True to route OCR through Tesseract instead of the default RapidOCR engine.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp:
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
-    markdown_text = convert_to_markdown(tmp_path)
+    markdown_text = convert_to_markdown(tmp_path, hebrew=hebrew)
     return {"filename": file.filename, "markdown": markdown_text}
 
 
@@ -108,11 +109,12 @@ async def chat(payload: dict):
 
 
 @app.post("/convert-to-word")
-async def convert_to_word(file: UploadFile = File(...)):
+async def convert_to_word(file: UploadFile = File(...), hebrew: bool = Form(False)):
     """
     Converts PDF -> Word, or an image (via OCR) -> Word.
     Docling auto-detects the input type; scanned PDFs and images both
     go through its OCR path, native PDFs go through direct text extraction.
+    Set hebrew=True to route OCR through Tesseract instead of the default RapidOCR engine.
     """
     suffix = Path(file.filename).suffix
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_in:
@@ -122,7 +124,7 @@ async def convert_to_word(file: UploadFile = File(...)):
     output_filename = Path(file.filename).stem + ".docx"
     output_path = str(Path(tempfile.gettempdir()) / output_filename)
 
-    convert_file_to_docx(input_path, output_path)
+    convert_file_to_docx(input_path, output_path, hebrew=hebrew)
 
     return FileResponse(
         output_path,
@@ -148,6 +150,7 @@ async def translate_document(
     source_lang: str = Form(...),
     target_lang: str = Form(...),
     summarize: bool = Form(False),
+    hebrew: bool = Form(False),
 ):
     # 1. Save upload
     with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp:
@@ -155,10 +158,10 @@ async def translate_document(
         tmp_path = tmp.name
 
     # 2. Convert + OCR
-    markdown_text = convert_to_markdown(tmp_path)
+    markdown_text = convert_to_markdown(tmp_path, hebrew=hebrew)
     chunks = chunk_text(markdown_text)
 
-    # 3. Translate each chunk with NLLB
+    # 3. Translate each chunk
     translator = get_translator()
     translated_chunks = translator.translate_chunks(chunks, source_lang, target_lang)
     translated_text = "\n\n".join(translated_chunks)

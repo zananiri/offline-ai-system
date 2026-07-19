@@ -6,13 +6,14 @@ docling-core==2.86.0
 ctranslate2==4.8.1
 ollama==0.6.2
 
-# Tier 2: used once, offline, for the NLLB conversion step only
+# Tier 2: used once, offline, for the MADLAD-400 conversion step only
 # (kept loose on purpose — these are never imported at runtime by the app,
-# only by scripts/convert_nllb_model.py — pinning them tightly just to
+# only by scripts/convert_translation_model.py — pinning them tightly just to
 # throw them away after conversion isn't worth the maintenance cost)
 transformers>=4.46,<5.0
 sentencepiece==0.2.0
 huggingface_hub>=0.27,<1.0
+hf_xet             # faster Hugging Face downloads (chunked transfer); without it, large model downloads can be very slow
 
 # Tier 3: stable orchestration layer — floor pins, resolved exactly by setup.ps1
 fastapi>=0.115,<1.0
@@ -21,6 +22,8 @@ gradio>=5.9,<6.0
 python-multipart>=0.0.12
 openpyxl>=3.1.5,<4.0     # used directly now for the Accountant tab's Excel export
 pypdf>=5.0,<6.0           # used to split multi-page PDFs into per-page documents
+pypdfium2>=4.30,<6.0      # renders PDF pages to images for the direct-Tesseract Hebrew OCR path
+pytesseract>=0.3.10,<0.4  # calls Tesseract directly for Hebrew (bypasses a Docling DPI bug — see document.py)
 
 # Tier 4: utilities
 py3langid==0.3.0          # lightweight offline language detection, no big model download

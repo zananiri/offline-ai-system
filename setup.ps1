@@ -31,7 +31,7 @@ if (-not $pyOk) {
 }
 
 # ---------------------------------------------------------------------------
-# 2. System tools: Ollama, pandoc, Tesseract (OCR fallback + language packs)
+# 2. System tools: Ollama, pandoc, Tesseract (Hebrew OCR only)
 # ---------------------------------------------------------------------------
 Write-Host "Installing Ollama..." -ForegroundColor Yellow
 winget install --id Ollama.Ollama -e --source winget
@@ -39,11 +39,16 @@ winget install --id Ollama.Ollama -e --source winget
 Write-Host "Installing pandoc (for markdown -> docx/pdf conversion)..." -ForegroundColor Yellow
 winget install --id JohnMacFarlane.Pandoc -e --source winget
 
-Write-Host "Installing Tesseract OCR (fallback engine + language packs)..." -ForegroundColor Yellow
+Write-Host "Installing Tesseract OCR..." -ForegroundColor Yellow
 winget install --id UB-Mannheim.TesseractOCR -e --source winget
-Write-Host "NOTE: open the Tesseract installer folder and re-run the installer" -ForegroundColor DarkYellow
-Write-Host "      once to add language packs for your 7 target languages" -ForegroundColor DarkYellow
-Write-Host "      (Modify > choose eng, fra, spa, deu, ara, chi_sim, rus, etc.)" -ForegroundColor DarkYellow
+Write-Host "IMPORTANT: the default OCR engine (RapidOCR) has no Hebrew support at all -" -ForegroundColor Red
+Write-Host "  Tesseract is the ONLY engine here that can read Hebrew, so its Hebrew" -ForegroundColor Red
+Write-Host "  language pack is REQUIRED, not optional, if you'll process Hebrew documents." -ForegroundColor Red
+Write-Host "  Re-run the Tesseract installer once more and, on the language selection" -ForegroundColor DarkYellow
+Write-Host "  page, tick 'Hebrew' (and any of eng/ara/chi_sim/rus/fra/deu/spa you want" -ForegroundColor DarkYellow
+Write-Host "  as extra fallback coverage)." -ForegroundColor DarkYellow
+Write-Host "  Also confirm tesseract.exe was added to PATH (winget usually handles this" -ForegroundColor DarkYellow
+Write-Host "  automatically) - a new PowerShell window may be needed to pick it up." -ForegroundColor DarkYellow
 
 # ---------------------------------------------------------------------------
 # 3. Python virtual environment + pinned dependencies
@@ -70,11 +75,11 @@ Write-Host "Pulling qwen2.5:7b-instruct-q4_K_M (~4.7GB)..." -ForegroundColor Yel
 ollama pull qwen2.5:7b-instruct-q4_K_M
 
 # ---------------------------------------------------------------------------
-# 5. Download + convert NLLB-200 to CTranslate2 format (one-time, needs internet)
+# 5. Download + convert MADLAD-400 to CTranslate2 format (one-time, needs internet)
 # ---------------------------------------------------------------------------
-Write-Host "Converting NLLB-200-distilled-1.3B to CTranslate2 format..." -ForegroundColor Yellow
-Write-Host "(this downloads ~5GB from Hugging Face once, then quantizes to int8 -> ~1.3GB)" -ForegroundColor DarkYellow
-python scripts\convert_nllb_model.py
+Write-Host "Converting MADLAD-400-3B to CTranslate2 format..." -ForegroundColor Yellow
+Write-Host "(this downloads several GB from Hugging Face once, then quantizes to int8)" -ForegroundColor DarkYellow
+python scripts\convert_translation_model.py
 
 Write-Host ""
 Write-Host "=== Setup complete ===" -ForegroundColor Cyan
