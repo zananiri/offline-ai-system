@@ -382,7 +382,7 @@ def process_invoices(uploaded_file, company_name, hebrew_batch, progress=gr.Prog
     return out_path, summary
 
 
-with gr.Blocks(title=" Ibrahim - AI Employee") as demo:
+with gr.Blocks(title=" Ibrahim Zananiri- AI Employee") as demo:
     with gr.Row():
         gr.Image(
             value=LOGO_PATH,
@@ -395,7 +395,7 @@ with gr.Blocks(title=" Ibrahim - AI Employee") as demo:
             show_download_button=False,
             interactive=False,
         )
-        gr.Markdown("# Ibrahim - AI Employee \n### Multi Purpose AI Agent")
+        gr.Markdown("# Clara - LPJ AI Agent \n### By Ibrahim Zananiri")
 
     with gr.Tab("Translate"):
         file_in = gr.File(label="Upload document (PDF, DOCX, PPTX, image)")
