@@ -35,7 +35,7 @@ offline-ai-system/
     ├── document.py               # Docling: convert + OCR (RapidOCR default, Tesseract for Hebrew) -> markdown, docx export
     ├── translate.py               # MADLAD-400 via CTranslate2
     ├── main.py                    # FastAPI orchestrator
-    └── ui.py                      # Gradio front end (Translate / Convert / Chat / Accountant)
+    └── ui.py                      # Gradio front end (Translate / Convert / Chat / Accountant / Legal)
 ```
 
 ## One-time setup
@@ -45,8 +45,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setup.ps1
 ```
 This installs Python 3.11, Ollama, pandoc, Tesseract, creates a venv,
-installs pinned packages, pulls the Ollama model, and downloads + quantizes
-MADLAD-400 to CTranslate2 format. Needs internet.
+installs pinned packages, pulls the Ollama models (qwen2.5, and DictaLM for
+the Legal tab), and downloads + quantizes MADLAD-400 to CTranslate2 format.
+Needs internet.
 
 **If you'll process any Hebrew documents**, re-run the Tesseract installer
 after setup finishes and tick "Hebrew" on the language selection page — this
@@ -91,7 +92,7 @@ From this point, no network access is needed at all.
 
 ## Notes / things worth knowing
 
-- **The 8 languages** (7 + Hebrew) are set in `app/translate.py` as a
+- **The 9 languages** (8 + Hebrew) are set in `app/translate.py` as a
   `LANGUAGES` dict mapping friendly names to MADLAD-400's language codes
   (mostly plain ISO 639-1, e.g. `en`, `fr`, `ar`, `zh`, `he`). MADLAD-400
   covers 400+ languages, so almost anything you pick will already be
@@ -101,15 +102,39 @@ From this point, no network access is needed at all.
   for clarity but isn't strictly required by the model itself.
 - **Every tab that touches OCR has a "Document is in Hebrew" checkbox** —
   Translate, Convert to Word, Chat (as an extra option below the chat box),
-  and Accountant. Leave it unchecked for everything else; it routes that
-  specific request through Tesseract instead of the default RapidOCR engine.
+  Accountant, and Legal. Leave it unchecked for everything else; it routes
+  that specific request through Tesseract instead of the default RapidOCR
+  engine.
 - **The Accountant tab's Hebrew checkbox applies to the whole batch** — if a
   single ZIP mixes Hebrew and non-Hebrew invoices, process them in two
   separate batches for best accuracy on each.
 - **Ollama's role is intentionally limited to non-translation work**
   (summarizing, cleaning up OCR'd structure, answering questions about a
-  document, classifying invoices). Don't ask it to also translate — a
-  dedicated MT model outperforms a general-purpose LLM at translation.
+  document, classifying invoices, the Legal tab). Don't ask it to also
+  translate — a dedicated MT model outperforms a general-purpose LLM at
+  translation.
 - **First run of `translate.py`** downloads MADLAD-400's tokenizer config
   (small) from Hugging Face and caches it — this happens once, triggered
   from `convert_translation_model.py` during setup, not at request time.
+- **Legal tab** chats with `hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M`
+  via Ollama (pulled by `setup.ps1`), instead of the default qwen2.5 model
+  used everywhere else. It supports the same document-attach + Hebrew-OCR
+  behavior as the Chat tab. Being a "thinking" model, it wraps its
+  reasoning in `<think>...</think>` before the actual answer — the backend
+  (`app/main.py`'s `/chat` endpoint) strips that out before it reaches the
+  UI, so only the final answer is shown.
+- **Hebrew-source translation reliability fix**: chunks of Hebrew text used
+  to be sent to MADLAD-400 far larger than the intended 400-char limit,
+  because the sentence-boundary regex used for chunking only recognized a
+  new sentence when followed by a Latin capital letter or digit — never a
+  Hebrew (or Arabic/Cyrillic/CJK) letter. That silently defeated both the
+  chunker and the sentence-level retry fallback for any non-Latin source
+  script, and MADLAD-400-3B is known to be far less reliable on long,
+  multi-sentence blocks. `app/document.py`'s `SENTENCE_SPLIT_RE` now
+  recognizes these scripts too, and `chunk_text` has a hard character-count
+  fallback (`_hard_split`) so no chunk can silently exceed the limit
+  regardless of script. Hebrew OCR text also had invisible Unicode
+  bidi-direction marks (inserted by Tesseract to keep mixed Hebrew/English
+  text in correct reading order) landing mid-word, which fragmented
+  tokenization further — `strip_bidi_controls` removes these both at
+  Hebrew-OCR extraction time and defensively right before translation.

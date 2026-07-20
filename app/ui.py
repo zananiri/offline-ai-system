@@ -17,6 +17,20 @@ from app.document import chunk_text
 
 BACKEND_URL = "http://localhost:8000"
 
+# Model backing the Legal tab. NOTE: this string is duplicated in
+# app/main.py (ui.py only talks to that backend over HTTP, so it can't
+# import a shared Python constant from it) — keep the two in sync if you
+# change the model. Must be pulled once via:
+#   ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
+LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M"
+
+LEGAL_SYSTEM_PROMPT = (
+    "You are a legal assistant. Answer clearly, and cite the relevant "
+    "section/clause of any attached document when you rely on it. You are "
+    "not a substitute for advice from a licensed attorney, and you should "
+    "say so when a question calls for one."
+)
+
 # Languages whose script reads right-to-left. Used to flip the translated-text
 # output box's text direction so Arabic/Hebrew results display correctly
 # instead of being left-aligned like Latin-script languages.
@@ -211,6 +225,50 @@ def chat_fn(message, history, hebrew_doc=False):
 
     messages = clean_history + [{"role": "user", "content": combined_message}]
     resp = requests.post(f"{BACKEND_URL}/chat", json={"messages": messages})
+    resp.raise_for_status()
+    return resp.json()["content"]
+
+
+def legal_chat_fn(message, history, hebrew_doc=False):
+    """
+    Same shape as chat_fn, but routed to LEGAL_MODEL (DictaLM-3.0-24B-Thinking)
+    with a light legal-assistant system prompt. Kept as a separate function
+    (rather than parameterizing chat_fn) so the two tabs can diverge later
+    without threading a model choice through the general Chat tab's UI.
+    """
+    if isinstance(message, dict):
+        user_text = message.get("text", "")
+        files = message.get("files", []) or []
+    else:
+        user_text = message
+        files = []
+
+    file_context = ""
+    if files:
+        file_context = extract_context_from_files(files, hebrew=hebrew_doc)
+        if len(file_context) > MAX_CONTEXT_CHARS:
+            file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
+
+    clean_history = [
+        {"role": turn["role"], "content": turn["content"]}
+        for turn in history
+        if isinstance(turn.get("content"), str)
+    ]
+
+    if file_context:
+        combined_message = (
+            f"The user attached the following document(s):\n\n{file_context}\n\n"
+            f"User question: {user_text}"
+        )
+    else:
+        combined_message = user_text
+
+    messages = (
+        [{"role": "system", "content": LEGAL_SYSTEM_PROMPT}]
+        + clean_history
+        + [{"role": "user", "content": combined_message}]
+    )
+    resp = requests.post(f"{BACKEND_URL}/chat", json={"messages": messages, "model": LEGAL_MODEL})
     resp.raise_for_status()
     return resp.json()["content"]
 
@@ -480,6 +538,22 @@ with gr.Blocks(title=" Ibrahim Zananiri- AI Employee") as demo:
             process_invoices,
             inputs=[zip_in, company_name_in, hebrew_batch_in],
             outputs=[report_out, summary_out],
+        )
+
+    with gr.Tab("Legal"):
+        gr.Markdown(
+            "Chat with the local Hebrew-legal model "
+            "(**DictaLM-3.0-24B-Thinking**, served via Ollama). Attach a PDF, DOCX, "
+            "PPTX, or image and ask questions about it — text (with OCR if needed) "
+            "is extracted and given to the model as context.\n\n"
+            "⚠️ This is not a substitute for advice from a licensed attorney."
+        )
+        legal_hebrew_checkbox = gr.Checkbox(
+            label="Attached document is in Hebrew (uses Tesseract OCR instead of the default engine)"
+        )
+        gr.ChatInterface(
+            fn=legal_chat_fn, type="messages", multimodal=True,
+            additional_inputs=[legal_hebrew_checkbox],
         )
 
 if __name__ == "__main__":

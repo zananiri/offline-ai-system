@@ -5,6 +5,7 @@ Pipeline: upload -> Docling (convert+OCR) -> language detect -> NLLB translate
           -> optional Ollama cleanup/summarization -> return / export docx
 """
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -20,6 +21,20 @@ from app.translate import get_translator, LANGUAGES
 app = FastAPI(title="Offline Translator + Document OCR")
 
 OLLAMA_MODEL = "qwen2.5:7b-instruct-q4_K_M"
+
+# Backs the Legal tab. Must be pulled once via:
+#   ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
+# (setup.ps1 does this for you.) NOTE: this string is duplicated in
+# app/ui.py (which only talks to this backend over HTTP and can't share a
+# Python constant with it) — keep the two in sync if you change the model.
+LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M"
+
+# DictaLM-3.0-24B-Thinking (like other "thinking" models, e.g. QwQ/R1-style)
+# emits its chain-of-thought wrapped in <think>...</think> before the real
+# answer. Strip it so the chat UI only ever shows the final response — this
+# is a no-op for models (like the default qwen2.5) that never emit the tag.
+# If DictaLM turns out to use a different wrapper tag, update this regex.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 
 def _convert_to_markdown_or_503(path: str, hebrew: bool) -> str:
@@ -108,11 +123,16 @@ async def extract_text(file: UploadFile = File(...), hebrew: bool = Form(False))
 async def chat(payload: dict):
     """
     General chat endpoint backed by Ollama.
-    Expects: {"messages": [{"role": "user"|"assistant"|"system", "content": "..."}]}
+    Expects: {"messages": [{"role": "user"|"assistant"|"system", "content": "..."}],
+              "model": "..."}  (model is optional, defaults to OLLAMA_MODEL — the
+    Legal tab passes LEGAL_MODEL explicitly, everything else uses the default).
     """
     messages = payload.get("messages", [])
-    response = ollama.chat(model=OLLAMA_MODEL, messages=messages)
-    return {"content": response["message"]["content"]}
+    model = payload.get("model") or OLLAMA_MODEL
+    response = ollama.chat(model=model, messages=messages)
+    content = response["message"]["content"]
+    content = _THINK_BLOCK_RE.sub("", content).strip()
+    return {"content": content}
 
 
 @app.post("/convert-to-word")

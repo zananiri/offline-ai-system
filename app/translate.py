@@ -5,13 +5,12 @@ Apache 2.0 licensed (Google Research) — safe for commercial use. This
 replaces NLLB-200, which is CC-BY-NC 4.0 and cannot legally be sold.
 """
 from pathlib import Path
-import re
 import sys
 import ctranslate2
 import py3langid as langid
 from transformers import AutoTokenizer
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\u00c0-\u024f])")
+from app.document import strip_bidi_controls, SENTENCE_SPLIT_RE as _SENTENCE_SPLIT_RE
 
 # Windows' console defaults to a legacy codepage (cp1252) that can't
 # represent Hebrew, Arabic, or many other characters — any print() with
@@ -63,6 +62,7 @@ LANGUAGES = {
     "english":   "en",
     "french":    "fr",
     "spanish":   "es",
+    "italian":   "it",
     "german":    "de",
     "arabic":    "ar",
     "chinese":   "zh",
@@ -132,6 +132,12 @@ class Translator:
         # sentences than on long multi-sentence blocks, so before giving up
         # on the whole chunk, retry sentence-by-sentence -- one bad sentence
         # shouldn't sink an otherwise-translatable paragraph.
+        #
+        # NOTE: this only helps if _SENTENCE_SPLIT_RE (imported from
+        # document.py, shared with chunk_text) can actually find sentence
+        # boundaries in this script. It's script-aware for Latin/Cyrillic/
+        # Hebrew/Arabic/CJK -- see document.py for the full explanation of
+        # why this used to silently fail for Hebrew.
         sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
         if len(sentences) <= 1:
             return text, False  # already as small as it gets, nothing left to retry
@@ -147,8 +153,16 @@ class Translator:
 
     def _translate_once(self, text: str, target_lang: str) -> tuple[str, bool]:
         """Single translation attempt for one piece of text, with no retry logic."""
+        # Defense-in-depth: strip bidi/formatting control characters here too
+        # (not just at Hebrew-OCR extraction time in document.py), so any
+        # chunk that picked up stray marks another way -- RTL content pasted
+        # into an otherwise-LTR document, chat input, etc. -- still tokenizes
+        # cleanly. Only the text fed to the model is cleaned; `text` itself
+        # is left untouched so the untranslated-section fallback below still
+        # shows exactly what was extracted, not a modified version of it.
+        clean_text = strip_bidi_controls(text)
         tgt_code = LANGUAGES[target_lang.lower()]
-        tagged_text = f"<2{tgt_code}> {text}"
+        tagged_text = f"<2{tgt_code}> {clean_text}"
         tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(tagged_text))
 
         results = self.translator.translate_batch(

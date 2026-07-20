@@ -97,7 +97,7 @@ pip freeze > requirements.lock.txt
 Write-Host "Exact resolved versions written to requirements.lock.txt" -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
-# 4. Pull the Ollama model (needs internet once; fully offline after this)
+# 4. Pull the Ollama models (needs internet once; fully offline after this)
 # ---------------------------------------------------------------------------
 Write-Host "Starting Ollama service..." -ForegroundColor Yellow
 Start-Process -NoNewWindow ollama serve
@@ -105,6 +105,9 @@ Start-Sleep -Seconds 5
 
 Write-Host "Pulling qwen2.5:7b-instruct-q4_K_M (~4.7GB)..." -ForegroundColor Yellow
 ollama pull qwen2.5:7b-instruct-q4_K_M
+
+Write-Host "Pulling hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M (Legal tab model, several GB)..." -ForegroundColor Yellow
+ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
 
 # ---------------------------------------------------------------------------
 # 5. Download + convert MADLAD-400 to CTranslate2 format (one-time, needs internet)

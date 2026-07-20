@@ -33,6 +33,10 @@ import pypandoc
 import pypdfium2 as pdfium
 import pytesseract
 from PIL import Image
+from docx import Document as DocxDocument
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
 from docling.datamodel.base_models import InputFormat
@@ -81,6 +85,33 @@ _HEBREW_OCR_LANG = "heb+eng"
 _HEBREW_OCR_DPI = 300
 _OCR_INPUT_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
+# Unicode bidi/formatting control characters: ZERO WIDTH SPACE / NON-JOINER /
+# JOINER, LEFT-TO-RIGHT MARK, RIGHT-TO-LEFT MARK, the LTR/RTL/POP embedding
+# & override marks, the newer directional isolates, and BOM.
+_BIDI_CONTROL_CHARS_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+
+
+def strip_bidi_controls(text: str) -> str:
+    """
+    Strips invisible Unicode bidi/formatting control characters from OCR'd
+    text.
+
+    Tesseract's Hebrew OCR (lang="heb+eng") inserts these routinely to
+    preserve correct reading order around embedded LTR runs (English words,
+    dates, numbers) inside RTL text -- completely correct and invisible when
+    the text is just *displayed*. But MADLAD-400's SentencePiece tokenizer
+    treats them as ordinary characters, and when one lands mid-word it
+    fragments tokenization badly enough that the model gives up translating
+    and echoes the (still-Hebrew) input back unchanged instead. Observed in
+    practice as a 100% "wrong language" rejection rate on Hebrew-sourced
+    chunks. They carry no translatable meaning, so it's safe to drop them
+    before the text is ever tokenized. See translate.py's _translate_once
+    for the other half of this fix (it's applied there too, defensively).
+    """
+    if not text:
+        return text
+    return _BIDI_CONTROL_CHARS_RE.sub("", text)
+
 
 def _render_pdf_pages(file_path: str, dpi: int = _HEBREW_OCR_DPI) -> list[Image.Image]:
     pdf = pdfium.PdfDocument(file_path)
@@ -126,7 +157,11 @@ def _ocr_hebrew(file_path: str) -> str:
         if text:
             page_texts.append(text)
 
-    return html.unescape("\n\n".join(page_texts))
+    joined = html.unescape("\n\n".join(page_texts))
+    # Strip bidi/formatting marks right at the source, so every downstream
+    # consumer (translation, chat context, summarization, the raw markdown
+    # returned to the UI) sees clean text, not just the translation path.
+    return strip_bidi_controls(joined)
 
 
 def convert_to_markdown(file_path: str, hebrew: bool = False) -> str:
@@ -141,7 +176,80 @@ def convert_to_markdown(file_path: str, hebrew: bool = False) -> str:
         return _ocr_hebrew(file_path)
 
     result = _default_converter.convert(Path(file_path))
-    return html.unescape(result.document.export_to_markdown())
+    markdown_text = html.unescape(result.document.export_to_markdown())
+    # Defensive: same bidi-control-character cleanup as the Hebrew/Tesseract
+    # path, applied here too in case RapidOCR ever emits stray marks on
+    # Arabic (or any other RTL-script) content.
+    return strip_bidi_controls(markdown_text)
+
+
+def _paragraph_is_rtl(text: str, threshold: float = 0.3) -> bool:
+    """
+    A paragraph is treated as RTL if a meaningful share of its *letters*
+    are Hebrew/Arabic -- not "contains any RTL character at all". That
+    keeps a mostly-English paragraph that happens to mention one Hebrew
+    name from getting force-flipped to right-aligned.
+    """
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return False
+    rtl_letters = sum(1 for ch in letters if 0x0590 <= ord(ch) <= 0x06FF)
+    return (rtl_letters / len(letters)) >= threshold
+
+
+def _set_paragraph_rtl(paragraph) -> None:
+    """
+    Marks a python-docx paragraph as right-to-left and right-aligned.
+
+    pandoc's markdown->docx conversion has no concept of paragraph
+    direction -- every paragraph comes out as an ordinary left-to-right
+    Word paragraph regardless of script. Word's renderer still reorders
+    individual Hebrew/Arabic glyphs correctly (that's the Unicode bidi
+    algorithm, and it happens automatically), but without the paragraph's
+    w:bidi flag set, Word (a) left-aligns the whole paragraph, which reads
+    backwards to an RTL reader, and (b) can misplace weakly-directional
+    runs -- numbers, dates, embedded Latin words -- relative to the
+    surrounding Hebrew/Arabic text. That second failure mode is the same
+    root problem ui.py's _anchor_rtl_lines works around for the Gradio
+    textbox; here we set the real OOXML property instead, since a Word
+    document actually has one.
+    """
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    pPr = paragraph._p.get_or_add_pPr()
+    bidi = OxmlElement("w:bidi")
+    bidi.set(qn("w:val"), "1")
+    pPr.append(bidi)
+    for run in paragraph.runs:
+        rPr = run._r.get_or_add_rPr()
+        rtl = OxmlElement("w:rtl")
+        rtl.set(qn("w:val"), "1")
+        rPr.append(rtl)
+
+
+def _apply_rtl_formatting(docx_path: str) -> None:
+    """
+    Walks every paragraph in the generated docx -- including inside tables,
+    since invoices/receipts routinely have RTL table content -- and flips
+    direction on any paragraph that's predominantly Hebrew/Arabic.
+    """
+    doc = DocxDocument(docx_path)
+    changed = False
+
+    def _process(paragraphs):
+        nonlocal changed
+        for p in paragraphs:
+            if _paragraph_is_rtl(p.text):
+                _set_paragraph_rtl(p)
+                changed = True
+
+    _process(doc.paragraphs)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                _process(cell.paragraphs)
+
+    if changed:
+        doc.save(docx_path)
 
 
 def export_docx(markdown_text: str, output_path: str) -> str:
@@ -156,6 +264,9 @@ def export_docx(markdown_text: str, output_path: str) -> str:
         format="md",
         outputfile=output_path,
     )
+    # pandoc's output is direction-agnostic (see _apply_rtl_formatting's
+    # docstring) -- fix up any Hebrew/Arabic paragraphs after the fact.
+    _apply_rtl_formatting(output_path)
     return output_path
 
 
@@ -168,15 +279,71 @@ def convert_file_to_docx(input_path: str, output_path: str, hebrew: bool = False
     return export_docx(markdown_text, output_path)
 
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\u00c0-\u024f])")
+# Matches a sentence boundary: one of .!? followed by whitespace, followed
+# by a character that plausibly starts a new sentence.
+#
+# IMPORTANT: the lookahead character class used to be Latin-only
+# (A-Z, 0-9, and accented Latin). That meant it NEVER matched inside
+# Hebrew, Arabic, Cyrillic, or CJK text -- there's no such thing as an
+# "uppercase" Hebrew letter, so a period-plus-Hebrew-letter never looked
+# like a sentence boundary. The practical effect: every long Hebrew
+# paragraph was chunked as a single oversized, unsplit block (observed:
+# 100-180 word chunks against an intended ~400-char/60-90-word target),
+# and translate.py's own sentence-retry fallback degraded to a no-op for
+# the same reason (a "sentence list" of length 1 can't be retried
+# piecewise). MADLAD-400-3B is documented (see translate.py) to be much
+# less reliable on long multi-sentence blocks than short ones, so this
+# was the primary cause of Hebrew-source translations failing on every
+# single chunk. Fixed by recognizing common non-Latin scripts as valid
+# sentence-starting characters too.
+SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z0-9\u00c0-\u024f"  # Latin (original)
+    r"\u0400-\u04ff"  # Cyrillic
+    r"\u0590-\u05ff"  # Hebrew
+    r"\u0600-\u06ff"  # Arabic
+    r"\u4e00-\u9fff"  # CJK unified ideographs
+    r"])"
+)
 
 
 def _split_into_sentences(paragraph: str) -> list[str]:
     """Best-effort sentence splitter. Not perfect (abbreviations, decimals),
     but good enough to keep chunks short -- which matters far more than
     perfect boundaries for translation reliability."""
-    sentences = _SENTENCE_SPLIT_RE.split(paragraph.strip())
+    sentences = SENTENCE_SPLIT_RE.split(paragraph.strip())
     return [s.strip() for s in sentences if s.strip()]
+
+
+def _hard_split(unit: str, max_chars: int) -> list[str]:
+    """
+    Force-splits an oversized unit on whitespace/word boundaries, greedily
+    packing words up to max_chars.
+
+    This is a last-resort safety net for chunk_text below: sentence
+    splitting is now script-aware (see SENTENCE_SPLIT_RE) but can still
+    hand back a single "sentence" that's still too long -- a genuine
+    run-on sentence, text with no recognized sentence punctuation at all,
+    or some future script/punctuation style this regex doesn't cover.
+    Rather than silently letting an oversized chunk through again (which is
+    exactly how the Hebrew bug above went unnoticed), every unit is now
+    guaranteed to fit within max_chars by the time it reaches the model.
+    """
+    if len(unit) <= max_chars:
+        return [unit]
+    words = unit.split()
+    if not words:
+        return [unit]
+    pieces, current = [], ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > max_chars and current:
+            pieces.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        pieces.append(current)
+    return pieces
 
 
 def chunk_text(markdown_text: str, max_chars: int = 400) -> list[str]:
@@ -191,6 +358,10 @@ def chunk_text(markdown_text: str, max_chars: int = 400) -> list[str]:
     max_chars are now split into individual sentences (not just left as one
     oversized chunk), and sentences are packed back together up to the limit
     so short sentences still get batched efficiently.
+
+    Sentence splitting is script-aware (see SENTENCE_SPLIT_RE) and, as a
+    final safety net, _hard_split guarantees no single piece handed to the
+    packer ever exceeds max_chars, regardless of script or punctuation.
     """
     paragraphs = [p for p in markdown_text.split("\n\n") if p.strip()]
     chunks, current = [], ""
@@ -204,9 +375,10 @@ def chunk_text(markdown_text: str, max_chars: int = 400) -> list[str]:
     for p in paragraphs:
         units = [p] if len(p) <= max_chars else _split_into_sentences(p)
         for unit in units:
-            if len(current) + len(unit) > max_chars and current:
-                flush()
-            current += unit + " "
+            for piece in _hard_split(unit, max_chars):
+                if len(current) + len(piece) > max_chars and current:
+                    flush()
+                current += piece + " "
 
     flush()
     return chunks
