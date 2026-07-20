@@ -17,6 +17,39 @@ from app.document import chunk_text
 
 BACKEND_URL = "http://localhost:8000"
 
+# Languages whose script reads right-to-left. Used to flip the translated-text
+# output box's text direction so Arabic/Hebrew results display correctly
+# instead of being left-aligned like Latin-script languages.
+RTL_LANGUAGES = {"arabic", "hebrew"}
+
+
+def _is_rtl(lang: str) -> bool:
+    return (lang or "").strip().lower() in RTL_LANGUAGES
+
+
+_RTL_MARK = "\u200f"  # RIGHT-TO-LEFT MARK (invisible, sets bidi direction only)
+
+
+def _anchor_rtl_lines(text: str) -> str:
+    """
+    Textbox(rtl=True) sets the box's overall base direction, but that alone
+    doesn't stop individual lines from getting visually reordered by the
+    browser's bidi algorithm -- a line that happens to start with a digit,
+    punctuation, or an embedded Latin word/number (invoice numbers, dates,
+    stray English terms) can pull that whole line's layout toward
+    left-to-right, scattering words out of their intended order.
+
+    Prefixing every non-empty line with an invisible RIGHT-TO-LEFT MARK
+    (U+200F) fixes each line's base direction as RTL regardless of its
+    first character, without adding any visible content.
+    """
+    if not text:
+        return text
+    return "\n".join(
+        f"{_RTL_MARK}{line}" if line.strip() else line
+        for line in text.split("\n")
+    )
+
 
 def process(file, source_lang, target_lang, summarize, hebrew_doc, progress=gr.Progress()):
     # Deterministic mapping already enforced in document.py: hebrew=True
@@ -34,10 +67,15 @@ def process(file, source_lang, target_lang, summarize, hebrew_doc, progress=gr.P
 
     chunks = chunk_text(markdown_text)
     if not chunks:
-        return "(no text found in document)", ocr_engine, "(not requested)"
+        return (
+            gr.update(value="(no text found in document)", rtl=_is_rtl(target_lang)),
+            ocr_engine,
+            "(not requested)",
+        )
 
     total_steps = len(chunks) + (1 if summarize else 0)
     translated_chunks = []
+    failed_chunks = 0
     for i, chunk in enumerate(chunks):
         progress((i + 1) / total_steps, desc=f"Translating chunk {i + 1}/{len(chunks)}...")
         resp = requests.post(
@@ -45,22 +83,62 @@ def process(file, source_lang, target_lang, summarize, hebrew_doc, progress=gr.P
             json={"text": chunk, "source_lang": source_lang, "target_lang": target_lang},
         )
         resp.raise_for_status()
-        translated_chunks.append(resp.json()["translated"])
+        data = resp.json()
+        translated_value = data.get("translated", "")
+        ok = data.get("ok", True)
+        if not isinstance(translated_value, str):
+            # Defensive: a backend/frontend version mismatch (e.g. main.py
+            # not unpacking the (text, ok) tuple translate() now returns)
+            # would otherwise land a list/tuple here and crash the whole
+            # request at the join() below. Degrade to a visible failure
+            # instead of a hard crash.
+            translated_value = str(translated_value)
+            ok = False
+        if ok:
+            translated_chunks.append(translated_value)
+        else:
+            failed_chunks += 1
+            translated_chunks.append(
+                f">>> COULD NOT TRANSLATE THIS SECTION (shown untranslated below) >>>\n"
+                f"{translated_value}\n"
+                f"<<< END UNTRANSLATED SECTION <<<"
+            )
 
     translated_text = "\n\n".join(translated_chunks)
+    if failed_chunks:
+        translated_text = (
+            f"⚠️ {failed_chunks} of {len(chunks)} section(s) could not be translated and are shown "
+            f"in their ORIGINAL, untranslated form below (marked with >>> / <<<). This almost always "
+            f"means the extracted text for those sections was garbled — usually poor OCR quality on "
+            f"a scanned page, rather than a translation problem. Check the OCR engine used below, and "
+            f"whether the source document/scan quality is high enough.\n\n"
+        ) + translated_text
 
     summary = "(not requested)"
     if summarize:
         progress(1.0, desc="Summarizing with AI...")
         messages = [
-            {"role": "system", "content": "You are a precise document summarizer."},
+            {
+                "role": "system",
+                "content": (
+                    f"You are a precise document summarizer. Respond ONLY in "
+                    f"{target_lang}, matching the language of the text you are "
+                    f"given -- never switch to a different language."
+                ),
+            },
             {"role": "user", "content": f"Summarize this in 3-5 bullet points:\n\n{translated_text}"},
         ]
         resp = requests.post(f"{BACKEND_URL}/chat", json={"messages": messages})
         resp.raise_for_status()
         summary = resp.json()["content"]
 
-    return translated_text, ocr_engine, summary
+    is_rtl = _is_rtl(target_lang)
+    display_text = _anchor_rtl_lines(translated_text) if is_rtl else translated_text
+    display_summary = (
+        gr.update(value=_anchor_rtl_lines(summary), rtl=True) if (is_rtl and summarize)
+        else gr.update(value=summary, rtl=False)
+    )
+    return gr.update(value=display_text, rtl=is_rtl), ocr_engine, display_summary
 
 
 def convert_to_word(file, hebrew_doc, progress=gr.Progress()):
@@ -333,7 +411,12 @@ with gr.Blocks(title=" Ibrahim - AI Employee") as demo:
             outputs=[hebrew_doc_translate, hebrew_status_translate],
         )
         run_btn = gr.Button("Translate")
-        output_text = gr.Textbox(label="Translated text", lines=20)
+        output_text = gr.Textbox(label="Translated text", lines=20, rtl=_is_rtl(tgt.value))
+        tgt.change(
+            lambda target_lang: gr.update(rtl=_is_rtl(target_lang)),
+            inputs=[tgt],
+            outputs=[output_text],
+        )
         ocr_engine_out = gr.Textbox(label="OCR engine (used if the document needed OCR)", interactive=False)
         output_summary = gr.Textbox(label="Summary (if requested)", lines=5)
         run_btn.click(

@@ -17,12 +17,12 @@ powershellollama serve
 New tab:
 powershell.\.venv\Scripts\Activate.ps1
 ollama pull qwen2.5:7b-instruct-q4_K_M
-6. Get the NLLB model onto the new machine:
+6. Get the MADLAD-400 model onto the new machine:
 
-If you copied models/nllb-ct2/ already → skip this step entirely.
+If you copied BOTH models/madlad400-ct2/ AND models/madlad400-tokenizer/ already → skip this step entirely.
 If not:
 
-powershellpython scripts\convert_nllb_model.py
+powershellpython scripts\convert_translation_model.py
 7. Run it, same as before:
 powershelluvicorn app.main:app --host 0.0.0.0 --port 8000
 new tab:

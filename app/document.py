@@ -23,6 +23,10 @@ Two separate OCR paths are used, deliberately:
   Docling's structured Markdown (no table detection). Fine for translation
   and chat use; a Hebrew document with heavy tables will lose that structure.
 """
+import html
+import os
+import re
+import shutil
 from pathlib import Path
 
 import pypandoc
@@ -32,6 +36,30 @@ from PIL import Image
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
 from docling.datamodel.base_models import InputFormat
+
+# Tesseract (the OCR *engine*, not the pytesseract Python wrapper) is a
+# separate program that must be installed on the machine and discoverable
+# on PATH. pytesseract just shells out to it. If it's not on PATH -- a very
+# common setup gap on Windows, especially right after installing it without
+# restarting the terminal -- pytesseract raises TesseractNotFoundError deep
+# inside a subprocess call, which otherwise surfaces as a raw, unhelpful
+# 500 traceback to the user. TESSERACT_CMD lets you point at an explicit
+# install location if PATH still doesn't pick it up for some reason (e.g.
+# installed for a different Windows user, or a portable install).
+_TESSERACT_CMD_OVERRIDE = os.environ.get("TESSERACT_CMD")
+if _TESSERACT_CMD_OVERRIDE:
+    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD_OVERRIDE
+
+
+def _tesseract_available() -> bool:
+    cmd = pytesseract.pytesseract.tesseract_cmd
+    # tesseract_cmd defaults to just "tesseract" (relies on PATH) unless
+    # overridden above with an explicit full path.
+    return shutil.which(cmd) is not None or Path(cmd).is_file()
+
+
+class TesseractNotAvailableError(RuntimeError):
+    """Raised when Hebrew OCR is requested but Tesseract isn't installed/found."""
 
 # --- Default converter: RapidOCR via Docling (higher accuracy, no Hebrew support) ---
 _default_pipeline_options = PdfPipelineOptions()
@@ -67,6 +95,16 @@ def _render_pdf_pages(file_path: str, dpi: int = _HEBREW_OCR_DPI) -> list[Image.
 
 
 def _ocr_hebrew(file_path: str) -> str:
+    if not _tesseract_available():
+        raise TesseractNotAvailableError(
+            "Hebrew OCR requires Tesseract, which isn't installed or isn't on PATH. "
+            "Install it from https://github.com/UB-Mannheim/tesseract/wiki, make sure "
+            "to check the Hebrew language pack during setup, then restart the backend "
+            "(PATH changes don't apply to already-running processes/terminals). "
+            "If it's installed somewhere PATH doesn't cover, set the TESSERACT_CMD "
+            "environment variable to the full path of tesseract.exe instead."
+        )
+
     suffix = Path(file_path).suffix.lower()
     if suffix == ".pdf":
         images = _render_pdf_pages(file_path)
@@ -88,7 +126,7 @@ def _ocr_hebrew(file_path: str) -> str:
         if text:
             page_texts.append(text)
 
-    return "\n\n".join(page_texts)
+    return html.unescape("\n\n".join(page_texts))
 
 
 def convert_to_markdown(file_path: str, hebrew: bool = False) -> str:
@@ -103,7 +141,7 @@ def convert_to_markdown(file_path: str, hebrew: bool = False) -> str:
         return _ocr_hebrew(file_path)
 
     result = _default_converter.convert(Path(file_path))
-    return result.document.export_to_markdown()
+    return html.unescape(result.document.export_to_markdown())
 
 
 def export_docx(markdown_text: str, output_path: str) -> str:
@@ -130,15 +168,45 @@ def convert_file_to_docx(input_path: str, output_path: str, hebrew: bool = False
     return export_docx(markdown_text, output_path)
 
 
-def chunk_text(markdown_text: str, max_chars: int = 800) -> list[str]:
-    """Simple paragraph-aware chunking so translation stays within a comfortable range."""
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\u00c0-\u024f])")
+
+
+def _split_into_sentences(paragraph: str) -> list[str]:
+    """Best-effort sentence splitter. Not perfect (abbreviations, decimals),
+    but good enough to keep chunks short -- which matters far more than
+    perfect boundaries for translation reliability."""
+    sentences = _SENTENCE_SPLIT_RE.split(paragraph.strip())
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def chunk_text(markdown_text: str, max_chars: int = 400) -> list[str]:
+    """
+    Paragraph- and sentence-aware chunking so translation chunks stay small.
+
+    max_chars was lowered from 800 to 400: MADLAD-400-3B (int8) is noticeably
+    less reliable translating long, multi-sentence blocks in one shot than
+    short ones -- observed failure mode is the model translating correctly
+    for a while, then degenerating into a repetition loop and drifting back
+    into the source language partway through. Paragraphs longer than
+    max_chars are now split into individual sentences (not just left as one
+    oversized chunk), and sentences are packed back together up to the limit
+    so short sentences still get batched efficiently.
+    """
     paragraphs = [p for p in markdown_text.split("\n\n") if p.strip()]
     chunks, current = [], ""
-    for p in paragraphs:
-        if len(current) + len(p) > max_chars and current:
+
+    def flush():
+        nonlocal current
+        if current.strip():
             chunks.append(current.strip())
-            current = ""
-        current += p + "\n\n"
-    if current.strip():
-        chunks.append(current.strip())
+        current = ""
+
+    for p in paragraphs:
+        units = [p] if len(p) <= max_chars else _split_into_sentences(p)
+        for unit in units:
+            if len(current) + len(unit) > max_chars and current:
+                flush()
+            current += unit + " "
+
+    flush()
     return chunks

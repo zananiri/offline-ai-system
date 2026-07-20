@@ -40,15 +40,47 @@ Write-Host "Installing pandoc (for markdown -> docx/pdf conversion)..." -Foregro
 winget install --id JohnMacFarlane.Pandoc -e --source winget
 
 Write-Host "Installing Tesseract OCR..." -ForegroundColor Yellow
-winget install --id UB-Mannheim.TesseractOCR -e --source winget
-Write-Host "IMPORTANT: the default OCR engine (RapidOCR) has no Hebrew support at all -" -ForegroundColor Red
-Write-Host "  Tesseract is the ONLY engine here that can read Hebrew, so its Hebrew" -ForegroundColor Red
-Write-Host "  language pack is REQUIRED, not optional, if you'll process Hebrew documents." -ForegroundColor Red
-Write-Host "  Re-run the Tesseract installer once more and, on the language selection" -ForegroundColor DarkYellow
-Write-Host "  page, tick 'Hebrew' (and any of eng/ara/chi_sim/rus/fra/deu/spa you want" -ForegroundColor DarkYellow
-Write-Host "  as extra fallback coverage)." -ForegroundColor DarkYellow
-Write-Host "  Also confirm tesseract.exe was added to PATH (winget usually handles this" -ForegroundColor DarkYellow
-Write-Host "  automatically) - a new PowerShell window may be needed to pick it up." -ForegroundColor DarkYellow
+$tesseractDir = "C:\Program Files\Tesseract-OCR"
+$tesseractExe = Join-Path $tesseractDir "tesseract.exe"
+if (-not (Test-Path $tesseractExe)) {
+    winget install --id UB-Mannheim.TesseractOCR -e --source winget
+}
+
+# The default winget install is silent and only bundles English -- it does
+# NOT show the graphical installer's language-selection screen, so Hebrew
+# is never included unless we fetch it separately. RapidOCR (the default
+# engine everywhere else in this app) has no Hebrew support at all, so this
+# is REQUIRED, not optional, for the Hebrew OCR path in document.py to work.
+$tessdataDir = Join-Path $tesseractDir "tessdata"
+$hebPath = Join-Path $tessdataDir "heb.traineddata"
+if (Test-Path $tessdataDir) {
+    if (Test-Path $hebPath) {
+        Write-Host "Hebrew language data already present." -ForegroundColor Green
+    } else {
+        Write-Host "Downloading Hebrew language data for Tesseract..." -ForegroundColor Yellow
+        Invoke-WebRequest `
+            -Uri "https://github.com/tesseract-ocr/tessdata/raw/main/heb.traineddata" `
+            -OutFile $hebPath
+    }
+} else {
+    Write-Host "WARNING: expected tessdata folder not found at $tessdataDir -" -ForegroundColor Red
+    Write-Host "  Tesseract may have installed to a different location. Download" -ForegroundColor Red
+    Write-Host "  https://github.com/tesseract-ocr/tessdata/raw/main/heb.traineddata" -ForegroundColor Red
+    Write-Host "  into its tessdata folder manually." -ForegroundColor Red
+}
+
+# Confirm PATH includes it (winget usually handles this automatically, but
+# a currently-open terminal won't see the change until it's reopened).
+if ($env:Path -notlike "*$tesseractDir*") {
+    Write-Host "Adding Tesseract to PATH..." -ForegroundColor Yellow
+    [Environment]::SetEnvironmentVariable(
+        "Path",
+        [Environment]::GetEnvironmentVariable("Path", "Machine") + ";$tesseractDir",
+        "Machine"
+    )
+    $env:Path += ";$tesseractDir"
+}
+Write-Host "Tesseract + Hebrew language data ready." -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
 # 3. Python virtual environment + pinned dependencies

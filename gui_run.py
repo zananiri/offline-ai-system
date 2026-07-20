@@ -99,14 +99,18 @@ class ServicePanel:
 
 def stream_output(process, out_queue):
     """Runs in a background thread; pushes subprocess output lines onto a queue."""
-    try:
-        for line in iter(process.stdout.readline, ""):
-            if line:
-                out_queue.put(line)
-            else:
-                break
-    except Exception as e:
-        out_queue.put(f"[reader thread error: {e}]\n")
+    while True:
+        try:
+            line = process.stdout.readline()
+        except Exception as e:
+            out_queue.put(f"[reader thread error: {e}]\n")
+            if process.poll() is not None:
+                break  # process already exited, no point retrying
+            continue  # otherwise keep trying rather than silently dying and
+                      # letting the child's pipe buffer fill up and hang it
+        if not line:
+            break
+        out_queue.put(line)
 
 
 def is_url_up(url, timeout=1.5):
@@ -239,6 +243,7 @@ class App:
                 cmd, cwd=str(PROJECT_ROOT),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
+                encoding="utf-8", errors="replace",
                 env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
             )

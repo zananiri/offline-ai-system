@@ -11,15 +11,22 @@ from pathlib import Path
 
 import ollama
 import py3langid as langid
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 
-from app.document import convert_to_markdown, chunk_text, convert_file_to_docx
+from app.document import convert_to_markdown, chunk_text, convert_file_to_docx, TesseractNotAvailableError
 from app.translate import get_translator, LANGUAGES
 
 app = FastAPI(title="Offline Translator + Document OCR")
 
 OLLAMA_MODEL = "qwen2.5:7b-instruct-q4_K_M"
+
+
+def _convert_to_markdown_or_503(path: str, hebrew: bool) -> str:
+    try:
+        return convert_to_markdown(path, hebrew=hebrew)
+    except TesseractNotAvailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.get("/health")
@@ -93,7 +100,7 @@ async def extract_text(file: UploadFile = File(...), hebrew: bool = Form(False))
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
-    markdown_text = convert_to_markdown(tmp_path, hebrew=hebrew)
+    markdown_text = _convert_to_markdown_or_503(tmp_path, hebrew)
     return {"filename": file.filename, "markdown": markdown_text}
 
 
@@ -124,7 +131,10 @@ async def convert_to_word(file: UploadFile = File(...), hebrew: bool = Form(Fals
     output_filename = Path(file.filename).stem + ".docx"
     output_path = str(Path(tempfile.gettempdir()) / output_filename)
 
-    convert_file_to_docx(input_path, output_path, hebrew=hebrew)
+    try:
+        convert_file_to_docx(input_path, output_path, hebrew=hebrew)
+    except TesseractNotAvailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     return FileResponse(
         output_path,
@@ -140,8 +150,8 @@ async def translate_chunk(payload: dict):
     source_lang = payload.get("source_lang")
     target_lang = payload.get("target_lang")
     translator = get_translator()
-    translated = translator.translate(text, source_lang, target_lang)
-    return {"translated": translated}
+    translated, ok = translator.translate(text, source_lang, target_lang)
+    return {"translated": translated, "ok": ok}
 
 
 @app.post("/translate-document")
@@ -158,12 +168,14 @@ async def translate_document(
         tmp_path = tmp.name
 
     # 2. Convert + OCR
-    markdown_text = convert_to_markdown(tmp_path, hebrew=hebrew)
+    markdown_text = _convert_to_markdown_or_503(tmp_path, hebrew)
     chunks = chunk_text(markdown_text)
 
     # 3. Translate each chunk
     translator = get_translator()
-    translated_chunks = translator.translate_chunks(chunks, source_lang, target_lang)
+    results = translator.translate_chunks(chunks, source_lang, target_lang)
+    translated_chunks = [text for text, _ok in results]
+    failed_chunks = sum(1 for _text, ok in results if not ok)
     translated_text = "\n\n".join(translated_chunks)
 
     # 4. Optional: Ollama pass to clean up structure / summarize
@@ -172,7 +184,14 @@ async def translate_document(
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[
-                {"role": "system", "content": "You are a precise document summarizer."},
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are a precise document summarizer. Respond ONLY in "
+                        f"{target_lang}, matching the language of the text you are "
+                        f"given -- never switch to a different language."
+                    ),
+                },
                 {"role": "user", "content": f"Summarize this in 3-5 bullet points:\n\n{translated_text}"},
             ],
         )
@@ -182,4 +201,6 @@ async def translate_document(
         "original_markdown": markdown_text,
         "translated_text": translated_text,
         "summary": summary,
+        "total_chunks": len(chunks),
+        "failed_chunks": failed_chunks,
     })
