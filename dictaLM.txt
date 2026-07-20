@@ -1,0 +1,1 @@
+ollama run hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
