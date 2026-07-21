@@ -2,6 +2,7 @@
 Gradio UI — talks to the FastAPI backend at localhost:8000.
 Run after main.py is already running: python -m app.ui
 """
+import re
 import tempfile
 import zipfile
 from pathlib import Path
@@ -21,8 +22,13 @@ BACKEND_URL = "http://localhost:8000"
 # app/main.py (ui.py only talks to that backend over HTTP, so it can't
 # import a shared Python constant from it) — keep the two in sync if you
 # change the model. Must be pulled once via:
-#   ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
-LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M"
+#   ollama pull hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M
+#
+# Swapped from 24B to 1.7B (Dicta's smallest size for this family) for speed
+# on CPU/iGPU-bound machines. Real tradeoff: weaker legal reasoning/citation
+# accuracy than the 24B — revert this line (and re-pull the 24B model) if
+# quality matters more than speed for your use case.
+LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 
 LEGAL_SYSTEM_PROMPT = (
     "You are a legal assistant. Answer clearly, and cite the relevant "
@@ -66,18 +72,20 @@ def _anchor_rtl_lines(text: str) -> str:
 
 
 def process(file, source_lang, target_lang, summarize, hebrew_doc, progress=gr.Progress()):
-    # Deterministic mapping already enforced in document.py: hebrew=True
-    # always routes through Tesseract, hebrew=False through RapidOCR — so
-    # this can be reported directly without a round trip to the backend.
-    ocr_engine = "Tesseract (Hebrew)" if hebrew_doc else "RapidOCR (default)"
-
     progress(0, desc="Extracting text from document (OCR if needed)...")
     with open(file.name, "rb") as f:
         extract_resp = requests.post(
             f"{BACKEND_URL}/extract-text", files={"file": f}, data={"hebrew": hebrew_doc}
         )
     extract_resp.raise_for_status()
-    markdown_text = extract_resp.json()["markdown"]
+    extract_data = extract_resp.json()
+    markdown_text = extract_data["markdown"]
+    # The backend can auto-detect Hebrew and route through Tesseract even
+    # if hebrew_doc was False (see document.py's resolve_hebrew_flag) --
+    # report what actually ran, not just what was requested, so this
+    # doesn't silently lie when that override kicks in.
+    hebrew_used = extract_data.get("hebrew_used", hebrew_doc)
+    ocr_engine = "Tesseract (Hebrew)" if hebrew_used else "RapidOCR (default)"
 
     chunks = chunk_text(markdown_text)
     if not chunks:
@@ -169,7 +177,13 @@ def convert_to_word(file, hebrew_doc, progress=gr.Progress()):
     with open(out_path, "wb") as out_f:
         out_f.write(resp.content)
     progress(1.0, desc="Done")
-    return out_path
+
+    # Auto-detection (document.py's resolve_hebrew_flag) can route this
+    # through Tesseract even if hebrew_doc was left unchecked -- surfaced
+    # via a response header since FileResponse can't carry a JSON body.
+    hebrew_used = resp.headers.get("X-Hebrew-OCR-Used", str(hebrew_doc)) == "True"
+    ocr_engine = "Tesseract (Hebrew)" if hebrew_used else "RapidOCR (default)"
+    return out_path, ocr_engine
 
 
 MAX_CONTEXT_CHARS = 6000  # keep injected document text within the model's comfortable context window
@@ -186,6 +200,34 @@ def extract_context_from_files(filepaths, hebrew=False):
         data = resp.json()
         contexts.append(f"--- Content of {Path(path).name} ---\n{data['markdown']}")
     return "\n\n".join(contexts)
+
+
+# Matches a request to CREATE a presentation, e.g. "make me a powerpoint
+# about X", "generate a slide deck on Y", "can you build a pptx for Z".
+# Requires both a presentation-ish noun AND a creation verb, so it doesn't
+# fire on unrelated mentions of the word "presentation" or "slides" (e.g.
+# "what should I say in my presentation tomorrow?").
+_PPTX_NOUN_RE = re.compile(r"\b(power ?point|pptx|slide ?deck|slides?|presentation)\b", re.IGNORECASE)
+_PPTX_VERB_RE = re.compile(
+    r"\b(make|create|generate|build|write|prepare|put together|draft|produce)\b", re.IGNORECASE
+)
+
+
+def _is_pptx_request(text: str) -> bool:
+    text = text or ""
+    return bool(_PPTX_NOUN_RE.search(text)) and bool(_PPTX_VERB_RE.search(text))
+
+
+def generate_presentation(prompt: str) -> str:
+    """Calls the backend's /generate-pptx endpoint and saves the returned
+    file to a fresh temp directory (per-call, so concurrent chats can't
+    clobber each other's presentation.pptx)."""
+    resp = requests.post(f"{BACKEND_URL}/generate-pptx", json={"prompt": prompt}, timeout=300)
+    resp.raise_for_status()
+    out_path = str(Path(tempfile.mkdtemp()) / "presentation.pptx")
+    with open(out_path, "wb") as f:
+        f.write(resp.content)
+    return out_path
 
 
 def chat_fn(message, history, hebrew_doc=False):
@@ -206,6 +248,26 @@ def chat_fn(message, history, hebrew_doc=False):
         file_context = extract_context_from_files(files, hebrew=hebrew_doc)
         if len(file_context) > MAX_CONTEXT_CHARS:
             file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
+
+    # PowerPoint generation is handled as its own branch rather than folded
+    # into the normal /chat call: it needs a structured JSON outline from
+    # the model (see app/pptx_generator.py), then a real .pptx file built
+    # from that outline and returned as a download, not a chat reply string.
+    if _is_pptx_request(user_text):
+        prompt = user_text
+        if file_context:
+            prompt = f"{user_text}\n\nBase the slides on this source material:\n{file_context}"
+        try:
+            pptx_path = generate_presentation(prompt)
+        except requests.HTTPError as e:
+            return (
+                "Sorry, I couldn't generate that presentation "
+                f"({e}). Try rephrasing the topic, or try again."
+            )
+        return [
+            "Here's the presentation you asked for — click below to download it:",
+            gr.File(pptx_path),
+        ]
 
     # Keep only plain-text turns from history — earlier attached files aren't
     # re-sent each turn (they already informed the answer they were attached to).
@@ -231,7 +293,7 @@ def chat_fn(message, history, hebrew_doc=False):
 
 def legal_chat_fn(message, history, hebrew_doc=False):
     """
-    Same shape as chat_fn, but routed to LEGAL_MODEL (DictaLM-3.0-24B-Thinking)
+    Same shape as chat_fn, but routed to LEGAL_MODEL (DictaLM-3.0-1.7B-Thinking)
     with a light legal-assistant system prompt. Kept as a separate function
     (rather than parameterizing chat_fn) so the two tabs can diverge later
     without threading a model choice through the general Chat tab's UI.
@@ -492,14 +554,20 @@ with gr.Blocks(title=" Ibrahim Zananiri- AI Employee") as demo:
         )
         convert_btn = gr.Button("Convert to Word")
         convert_output = gr.File(label="Download .docx")
+        convert_ocr_engine_out = gr.Textbox(label="OCR engine actually used", interactive=False)
         convert_btn.click(
-            convert_to_word, inputs=[convert_file_in, hebrew_doc_convert], outputs=[convert_output]
+            convert_to_word,
+            inputs=[convert_file_in, hebrew_doc_convert],
+            outputs=[convert_output, convert_ocr_engine_out],
         )
 
     with gr.Tab("Chat"):
         gr.Markdown("Chat with the local AI model. Attach a PDF, DOCX, PPTX, or image "
                     "and ask questions about it — text (with OCR if needed) is extracted "
-                    "and given to the model as context.")
+                    "and given to the model as context.\n\n"
+                    "💡 Ask it to **\"make/create/generate a PowerPoint (presentation/slide "
+                    "deck) about ...\"** and it will build a downloadable .pptx file — attach "
+                    "a document first if you want the slides based on that document.")
         chat_hebrew_checkbox = gr.Checkbox(
             label="Attached document is in Hebrew (uses Tesseract OCR instead of the default engine)"
         )

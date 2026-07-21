@@ -40,6 +40,21 @@ def _looks_degenerate(text: str, min_words: int = 40, max_repeat_ratio: float = 
     return unique_ratio < max_repeat_ratio
 
 
+# py3langid frequently confuses short/noisy text between languages that
+# share the same script (Hebrew <-> Yiddish, Arabic <-> Persian/Urdu/Pashto)
+# -- and text here is especially prone to that: OCR'd input is often short
+# and imperfect. Without this, a same-script misdetection on a genuinely
+# correct translation causes _wrong_language to wrongly reject it, and the
+# caller then falls back to showing the original untranslated (and
+# possibly still-noisy OCR'd) text instead -- i.e. a good translation gets
+# thrown away because of a language-ID false positive, not a real model
+# failure.
+_SCRIPT_EQUIVALENT_LANGS = {
+    "he": {"he", "yi"},
+    "ar": {"ar", "fa", "ur", "ps"},
+}
+
+
 def _wrong_language(text: str, expected_code: str, min_words: int = 6) -> bool:
     """
     Detects a distinct failure mode from _looks_degenerate: the model
@@ -53,7 +68,11 @@ def _wrong_language(text: str, expected_code: str, min_words: int = 6) -> bool:
     if len(words) < min_words:
         return False
     detected, _ = langid.classify(text)
-    return detected != expected_code
+    if detected == expected_code:
+        return False
+    if detected in _SCRIPT_EQUIVALENT_LANGS.get(expected_code, set()):
+        return False
+    return True
 
 # Edit this to match your 7 target languages.
 # MADLAD-400 covers 400+ languages, mostly using plain ISO 639-1 codes.

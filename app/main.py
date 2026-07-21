@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 
 import ollama
@@ -15,19 +16,32 @@ import py3langid as langid
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 
-from app.document import convert_to_markdown, chunk_text, convert_file_to_docx, TesseractNotAvailableError
+from app.document import (
+    convert_to_markdown,
+    chunk_text,
+    convert_file_to_docx,
+    resolve_hebrew_flag,
+    TesseractNotAvailableError,
+)
 from app.translate import get_translator, LANGUAGES
+from app.pptx_generator import generate_pptx
 
 app = FastAPI(title="Offline Translator + Document OCR")
 
 OLLAMA_MODEL = "qwen2.5:7b-instruct-q4_K_M"
 
 # Backs the Legal tab. Must be pulled once via:
-#   ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
+#   ollama pull hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M
 # (setup.ps1 does this for you.) NOTE: this string is duplicated in
 # app/ui.py (which only talks to this backend over HTTP and can't share a
 # Python constant with it) — keep the two in sync if you change the model.
-LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M"
+#
+# Swapped from the 24B variant to this 1.7B one for speed on CPU/iGPU-bound
+# machines -- it's the smallest size Dicta publishes for this family (24B,
+# 12B, 1.7B), so this is as fast as a DictaLM "thinking" model gets. Real
+# tradeoff: noticeably weaker legal reasoning/citation accuracy than the 24B.
+# To go back, just restore the line above (after re-pulling the 24B model).
+LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 
 # DictaLM-3.0-24B-Thinking (like other "thinking" models, e.g. QwQ/R1-style)
 # emits its chain-of-thought wrapped in <think>...</think> before the real
@@ -115,8 +129,12 @@ async def extract_text(file: UploadFile = File(...), hebrew: bool = Form(False))
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
-    markdown_text = _convert_to_markdown_or_503(tmp_path, hebrew)
-    return {"filename": file.filename, "markdown": markdown_text}
+    # Resolved once up front (rather than just passing `hebrew` through)
+    # so the response can honestly report which OCR path actually ran --
+    # resolve_hebrew_flag can auto-detect and override a False here.
+    hebrew_used = resolve_hebrew_flag(tmp_path, hebrew)
+    markdown_text = _convert_to_markdown_or_503(tmp_path, hebrew_used)
+    return {"filename": file.filename, "markdown": markdown_text, "hebrew_used": hebrew_used}
 
 
 @app.post("/chat")
@@ -135,6 +153,41 @@ async def chat(payload: dict):
     return {"content": content}
 
 
+@app.post("/generate-pptx")
+async def generate_pptx_endpoint(payload: dict):
+    """
+    Generates a PowerPoint (.pptx) file from a plain-language prompt.
+
+    Expects: {"prompt": "...", "model": "..."} (model optional, defaults to
+    OLLAMA_MODEL -- same model the Chat tab already uses for everything
+    else). The prompt can just be a topic ("the history of coffee") or can
+    include attached-document text to summarize into slides (the Chat tab's
+    UI builds that combined prompt before calling this).
+
+    Uses qwen2.5 (via Ollama) to draft a JSON slide outline, then
+    python-pptx (MIT licensed) to build the actual file -- both steps run
+    fully locally, no external/paid presentation-generation service involved.
+    """
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Missing 'prompt'.")
+    model = payload.get("model") or OLLAMA_MODEL
+
+    output_path = str(Path(tempfile.gettempdir()) / f"presentation_{uuid.uuid4().hex}.pptx")
+    try:
+        generate_pptx(prompt, output_path, model=model)
+    except ValueError as e:
+        # The model's outline couldn't be parsed as usable JSON even after a
+        # retry -- surface this as a clean error rather than a raw 500.
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return FileResponse(
+        output_path,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename="presentation.pptx",
+    )
+
+
 @app.post("/convert-to-word")
 async def convert_to_word(file: UploadFile = File(...), hebrew: bool = Form(False)):
     """
@@ -151,8 +204,9 @@ async def convert_to_word(file: UploadFile = File(...), hebrew: bool = Form(Fals
     output_filename = Path(file.filename).stem + ".docx"
     output_path = str(Path(tempfile.gettempdir()) / output_filename)
 
+    hebrew_used = resolve_hebrew_flag(input_path, hebrew)
     try:
-        convert_file_to_docx(input_path, output_path, hebrew=hebrew)
+        convert_file_to_docx(input_path, output_path, hebrew=hebrew_used)
     except TesseractNotAvailableError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -160,6 +214,7 @@ async def convert_to_word(file: UploadFile = File(...), hebrew: bool = Form(Fals
         output_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         filename=output_filename,
+        headers={"X-Hebrew-OCR-Used": str(hebrew_used)},
     )
 
 
@@ -188,7 +243,8 @@ async def translate_document(
         tmp_path = tmp.name
 
     # 2. Convert + OCR
-    markdown_text = _convert_to_markdown_or_503(tmp_path, hebrew)
+    hebrew_used = resolve_hebrew_flag(tmp_path, hebrew)
+    markdown_text = _convert_to_markdown_or_503(tmp_path, hebrew_used)
     chunks = chunk_text(markdown_text)
 
     # 3. Translate each chunk
@@ -223,4 +279,5 @@ async def translate_document(
         "summary": summary,
         "total_chunks": len(chunks),
         "failed_chunks": failed_chunks,
+        "hebrew_used": hebrew_used,
     })

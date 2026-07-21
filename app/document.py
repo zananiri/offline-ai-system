@@ -32,7 +32,9 @@ from pathlib import Path
 import pypandoc
 import pypdfium2 as pdfium
 import pytesseract
+from pytesseract import Output
 from PIL import Image
+from pypdf import PdfReader
 from docx import Document as DocxDocument
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
@@ -85,6 +87,22 @@ _HEBREW_OCR_LANG = "heb+eng"
 _HEBREW_OCR_DPI = 300
 _OCR_INPUT_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
+# Tesseract confidence is 0-100 per recognized word. image_to_string (the
+# old approach) returns Tesseract's best guess for EVERY detected region
+# regardless of confidence -- on a noisy/low-quality scan that includes a
+# lot of near-random character soup for regions Tesseract barely
+# recognized at all (stray marks, table borders, watermark bleed-through,
+# etc.), which is what shows up downstream as "unknown characters" in the
+# extracted text. _ocr_image_filtered below uses image_to_data instead and
+# drops anything under this threshold.
+_OCR_MIN_CONFIDENCE = 40
+
+# Forces the LSTM-only engine instead of Tesseract's default --oem 3
+# (legacy + LSTM combined, which lets the older/less accurate legacy
+# engine's output win in some cases). LSTM-only is consistently more
+# accurate on Hebrew script in practice.
+_HEBREW_OCR_OEM = 1
+
 # Unicode bidi/formatting control characters: ZERO WIDTH SPACE / NON-JOINER /
 # JOINER, LEFT-TO-RIGHT MARK, RIGHT-TO-LEFT MARK, the LTR/RTL/POP embedding
 # & override marks, the newer directional isolates, and BOM.
@@ -113,6 +131,25 @@ def strip_bidi_controls(text: str) -> str:
     return _BIDI_CONTROL_CHARS_RE.sub("", text)
 
 
+# The Unicode replacement character, the object-replacement character, and
+# the Private Use Area range -- these are what Tesseract (and some font
+# encodings it misreads) emit when it "recognizes" a glyph shape but the
+# result isn't a real character. They carry no translatable meaning and,
+# like the bidi marks above, can fragment MADLAD-400's tokenization if left
+# in. _OCR_MIN_CONFIDENCE filtering in _ocr_image_filtered catches most of
+# this at the source, but this is a defensive second pass for whatever
+# still slips through (e.g. a confidently-wrong glyph substitution).
+_OCR_GARBAGE_CHARS_RE = re.compile("[\ufffc\ufffd\ue000-\uf8ff]")
+
+
+def strip_ocr_noise(text: str) -> str:
+    """Strips replacement/private-use-area characters left behind by OCR
+    misreads. See _OCR_GARBAGE_CHARS_RE above for what this targets."""
+    if not text:
+        return text
+    return _OCR_GARBAGE_CHARS_RE.sub("", text)
+
+
 def _render_pdf_pages(file_path: str, dpi: int = _HEBREW_OCR_DPI) -> list[Image.Image]:
     pdf = pdfium.PdfDocument(file_path)
     scale = dpi / 72  # pypdfium2's render scale is relative to a 72-DPI baseline
@@ -125,7 +162,107 @@ def _render_pdf_pages(file_path: str, dpi: int = _HEBREW_OCR_DPI) -> list[Image.
     return images
 
 
+# Below this many total characters, a PDF's "native text layer" is treated
+# as not actually usable (e.g. a scanned PDF where only a stray bit of
+# metadata happens to be real text) -- falls back to real OCR instead.
+_MIN_NATIVE_TEXT_CHARS = 200
+
+
+def _extract_native_pdf_text(file_path: str) -> str | None:
+    """
+    Extracts a PDF's own embedded text layer directly via pypdf -- no
+    rendering or OCR involved at all. Many "PDFs" -- especially browser
+    Print-to-PDF output, which is exactly what government/news pages
+    saved as PDF usually are -- already contain a perfect, digitally
+    authored text layer. Routing these through rasterize-then-Tesseract-OCR
+    anyway is strictly worse: it throws away already-correct text and
+    reintroduces real OCR misreads. Confirmed directly in practice: a
+    Hebrew government-site PDF with a clean native text layer came out of
+    the old rasterize+OCR path with fragments like "Nan?", stray Latin
+    letters substituted for Hebrew words, and transposed digits, on a
+    document that had zero errors in its own embedded text.
+
+    Returns None (so the caller falls back to actual OCR) if there's no
+    usable text layer at all (a genuinely scanned/image-only PDF), or if
+    what's extracted doesn't look predominantly Hebrew -- the same
+    corrupted-font-encoding failure mode _detect_script_is_hebrew_from_image
+    already guards against (some Hebrew PDFs have a text layer where a
+    meaningful share of glyphs decode to garbage/Latin-lookalike
+    characters; that's not trustworthy to use verbatim either).
+    """
+    try:
+        reader = PdfReader(file_path)
+        text = "\n\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    except Exception:
+        return None
+    if len(text) < _MIN_NATIVE_TEXT_CHARS:
+        return None
+
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return None
+    hebrew_ratio = sum(1 for ch in letters if 0x0590 <= ord(ch) <= 0x05FF) / len(letters)
+    if hebrew_ratio < _HEBREW_SCRIPT_RATIO_THRESHOLD:
+        return None
+
+    return text
+
+
+def _ocr_image_filtered(img: Image.Image, dpi: int = _HEBREW_OCR_DPI) -> str:
+    """
+    Word-confidence-filtered OCR for a single image, replacing a plain
+    pytesseract.image_to_string call.
+
+    image_to_string keeps Tesseract's single best-guess glyph sequence for
+    every detected text region no matter how low-confidence that guess
+    was. image_to_data exposes per-word confidence, so this drops any word
+    below _OCR_MIN_CONFIDENCE -- removing the noise that otherwise shows up
+    as "unknown characters" -- while reconstructing paragraph/line breaks
+    from Tesseract's block/paragraph/line numbering so downstream chunking
+    (chunk_text, which splits on blank lines) still sees real paragraphs.
+    """
+    data = pytesseract.image_to_data(
+        img, lang=_HEBREW_OCR_LANG,
+        config=f"--psm 3 --oem {_HEBREW_OCR_OEM} --dpi {dpi}",
+        output_type=Output.DICT,
+    )
+
+    lines: dict[tuple[int, int, int], list[str]] = {}
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+        if not word:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1  # Tesseract uses -1 for non-text rows (e.g. block/line markers)
+        if conf < _OCR_MIN_CONFIDENCE:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        lines.setdefault(key, []).append(word)
+
+    # data's rows are already in reading order, so sorting by the
+    # (block, par, line) key preserves it -- group lines into paragraphs.
+    paragraphs: dict[tuple[int, int], list[str]] = {}
+    for (block, par, _line), words in sorted(lines.items()):
+        paragraphs.setdefault((block, par), []).append(" ".join(words))
+
+    return "\n\n".join(
+        "\n".join(line_texts) for _, line_texts in sorted(paragraphs.items())
+    ).strip()
+
+
 def _ocr_hebrew(file_path: str) -> str:
+    suffix = Path(file_path).suffix.lower()
+
+    if suffix == ".pdf":
+        native_text = _extract_native_pdf_text(file_path)
+        if native_text is not None:
+            print(f"[ocr] {Path(file_path).name}: usable native PDF text layer found, "
+                  "skipping rasterize+OCR entirely.")
+            return strip_ocr_noise(strip_bidi_controls(html.unescape(native_text)))
+        print(f"[ocr] {Path(file_path).name}: no usable native text layer, falling back to Tesseract OCR.")
+
     if not _tesseract_available():
         raise TesseractNotAvailableError(
             "Hebrew OCR requires Tesseract, which isn't installed or isn't on PATH. "
@@ -136,7 +273,6 @@ def _ocr_hebrew(file_path: str) -> str:
             "environment variable to the full path of tesseract.exe instead."
         )
 
-    suffix = Path(file_path).suffix.lower()
     if suffix == ".pdf":
         images = _render_pdf_pages(file_path)
     else:
@@ -150,28 +286,166 @@ def _ocr_hebrew(file_path: str) -> str:
         # orientation/script-detection (OSD) sub-pass — OSD is exactly the
         # sub-step that fails with bad DPI in Docling's wrapper, so we skip
         # it here by design. --dpi is passed explicitly as a second safeguard
-        # on top of the DPI already embedded in the image itself.
-        text = pytesseract.image_to_string(
-            img, lang=_HEBREW_OCR_LANG, config=f"--psm 3 --dpi {_HEBREW_OCR_DPI}"
-        ).strip()
+        # on top of the DPI already embedded in the image itself. --oem 1
+        # forces the LSTM-only engine (see _HEBREW_OCR_OEM). Confidence
+        # filtering happens inside _ocr_image_filtered.
+        text = _ocr_image_filtered(img, dpi=_HEBREW_OCR_DPI)
         if text:
             page_texts.append(text)
 
     joined = html.unescape("\n\n".join(page_texts))
-    # Strip bidi/formatting marks right at the source, so every downstream
-    # consumer (translation, chat context, summarization, the raw markdown
-    # returned to the UI) sees clean text, not just the translation path.
-    return strip_bidi_controls(joined)
+    # Strip bidi/formatting marks and any remaining OCR-noise characters
+    # right at the source, so every downstream consumer (translation, chat
+    # context, summarization, the raw markdown returned to the UI) sees
+    # clean text, not just the translation path.
+    return strip_ocr_noise(strip_bidi_controls(joined))
+
+
+# Threshold for _sample_text_hebrew_ratio / auto-detection below: if at
+# least this fraction of the letters in a page's text are Hebrew-script,
+# the document is treated as Hebrew. Deliberately low -- a Hebrew document
+# with English proper nouns, numbers, or a mixed letterhead should still
+# clear this easily, while a genuinely non-Hebrew document with a stray
+# Hebrew word or two should not.
+_HEBREW_SCRIPT_RATIO_THRESHOLD = 0.15
+
+
+def _sample_text_hebrew_ratio(file_path: str, max_pages: int = 5) -> float | None:
+    """
+    Cheaply samples a PDF's existing text layer (no rendering/OCR at all)
+    and returns the fraction of Hebrew-script letters among all letters
+    found. Returns None if there's no extractable text layer at all (a
+    fully scanned PDF), in which case _detect_script_is_hebrew falls back
+    to image-based script detection instead.
+    """
+    try:
+        reader = PdfReader(file_path)
+    except Exception:
+        return None
+    text_parts = []
+    for page in reader.pages[:max_pages]:
+        try:
+            text_parts.append(page.extract_text() or "")
+        except Exception:
+            continue
+    sample = "".join(text_parts)
+    letters = [ch for ch in sample if ch.isalpha()]
+    if not letters:
+        return None
+    hebrew_letters = sum(1 for ch in letters if 0x0590 <= ord(ch) <= 0x05FF)
+    return hebrew_letters / len(letters)
+
+
+def _detect_script_is_hebrew_from_image(file_path: str) -> bool | None:
+    """
+    Renders (or opens) a single sample page/image and runs Tesseract's OSD
+    (orientation + script detection) on it. This works directly off pixels,
+    so -- unlike _sample_text_hebrew_ratio -- it can't be fooled by a PDF
+    whose embedded text layer has a broken/non-standard font encoding
+    (a real, observed failure mode: SOME glyphs in an otherwise-Hebrew PDF
+    decode to garbage Latin-lookalike characters, which dilutes the
+    text-layer ratio without the page actually containing less Hebrew).
+    Returns None if OSD isn't usable at all (Tesseract/osd.traineddata
+    missing, or nothing to render).
+    """
+    if not _tesseract_available():
+        return None
+    suffix = Path(file_path).suffix.lower()
+    try:
+        if suffix == ".pdf":
+            images = _render_pdf_pages(file_path, dpi=150)  # OSD doesn't need full OCR DPI
+            sample_img = images[0] if images else None
+        elif suffix in _OCR_INPUT_EXTS:
+            sample_img = Image.open(file_path)
+        else:
+            return None
+        if sample_img is None:
+            return None
+        osd = pytesseract.image_to_osd(sample_img, config="--psm 0", output_type=Output.DICT)
+        return (osd.get("script") or "").lower() == "hebrew"
+    except Exception:
+        # OSD needs osd.traineddata, which isn't guaranteed present on every
+        # install -- fail open (None) rather than raise, so a missing OSD
+        # pack degrades to "trust the text-layer signal", not a broken request.
+        return None
+
+
+def _detect_script_is_hebrew(file_path: str) -> bool | None:
+    """
+    Best-effort automatic Hebrew detection, so a Hebrew document still gets
+    routed through the Tesseract pipeline even if the caller forgot to pass
+    hebrew=True. This is not a hypothetical: a native-text-layer Hebrew PDF
+    run through the default RapidOCR pipeline (which has no Hebrew model
+    at all -- see the module docstring) produces text that's part-correct,
+    part nonsense Latin-lookalike guesses. Every UI tab except Translate
+    requires the user to manually tick a "document is in Hebrew" checkbox,
+    so this is the actual failure mode to defend against, not an edge case.
+
+    Combines two independent signals with OR, not "prefer one, fall back to
+    the other": a confident text-layer ratio (_sample_text_hebrew_ratio) is
+    trusted immediately since it's cheap, but a low/inconclusive ratio does
+    NOT rule Hebrew out on its own -- it can just mean the PDF's embedded
+    text layer is partially broken (see _detect_script_is_hebrew_from_image's
+    docstring). So the image-based OSD check still runs and can independently
+    confirm Hebrew even when the text-layer signal alone would have said no.
+    Given the asymmetric cost here (an unnecessary Hebrew-OCR pass on a
+    non-Hebrew doc is cheap; missing a genuinely Hebrew doc produces
+    unreadable output), this deliberately errs toward "yes".
+    """
+    suffix = Path(file_path).suffix.lower()
+    if suffix not in _OCR_INPUT_EXTS:
+        return None
+
+    text_ratio = _sample_text_hebrew_ratio(file_path) if suffix == ".pdf" else None
+    print(f"[document] {Path(file_path).name}: text-layer Hebrew ratio = {text_ratio}")
+    if text_ratio is not None and text_ratio >= _HEBREW_SCRIPT_RATIO_THRESHOLD:
+        return True
+
+    image_signal = _detect_script_is_hebrew_from_image(file_path)
+    print(f"[document] {Path(file_path).name}: image OSD Hebrew signal = {image_signal}")
+    if image_signal is not None:
+        return image_signal
+
+    # No usable image signal (Tesseract/OSD unavailable) -- fall back to
+    # whatever the text layer suggested, even if below threshold, rather
+    # than returning an unhelpful None past this point.
+    if text_ratio is not None:
+        return text_ratio >= _HEBREW_SCRIPT_RATIO_THRESHOLD
+    return None
+
+
+def resolve_hebrew_flag(file_path: str, hebrew: bool) -> bool:
+    """
+    Returns the effective Hebrew flag for this file: the caller's explicit
+    request, OR'd with best-effort auto-detection -- so a Hebrew document
+    is routed correctly even if the UI checkbox for it was left unchecked.
+    An explicit hebrew=True is always trusted outright and skips detection
+    entirely. Exposed separately (not just inlined into convert_to_markdown)
+    so callers like main.py can report back which OCR engine actually ran.
+    """
+    if hebrew:
+        print(f"[document] {Path(file_path).name}: hebrew=True passed explicitly")
+        return True
+    if Path(file_path).suffix.lower() not in _OCR_INPUT_EXTS:
+        return False
+    resolved = bool(_detect_script_is_hebrew(file_path))
+    print(f"[document] {Path(file_path).name}: resolved hebrew={resolved} (auto-detected)")
+    return resolved
 
 
 def convert_to_markdown(file_path: str, hebrew: bool = False) -> str:
     """
     Convert any supported document (PDF/DOCX/PPTX/HTML/image) to Markdown.
     Set hebrew=True to OCR through Tesseract directly instead of Docling's
-    default RapidOCR pipeline — only do this for documents actually in
+    default RapidOCR pipeline -- only do this for documents actually in
     Hebrew. Only affects PDFs and raw images; native formats (DOCX/PPTX)
     never go through OCR at all, so the flag has no effect on them.
+
+    hebrew=False is no longer taken purely at face value: resolve_hebrew_flag
+    auto-detects Hebrew content and overrides it when needed (see that
+    function's docstring for why this matters in practice).
     """
+    hebrew = resolve_hebrew_flag(file_path, hebrew)
     if hebrew and Path(file_path).suffix.lower() in _OCR_INPUT_EXTS:
         return _ocr_hebrew(file_path)
 

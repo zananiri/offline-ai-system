@@ -106,8 +106,13 @@ Start-Sleep -Seconds 5
 Write-Host "Pulling qwen2.5:7b-instruct-q4_K_M (~4.7GB)..." -ForegroundColor Yellow
 ollama pull qwen2.5:7b-instruct-q4_K_M
 
-Write-Host "Pulling hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M (Legal tab model, several GB)..." -ForegroundColor Yellow
-ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
+# Swapped to the 1.7B size (Dicta's smallest for this family) for speed on
+# CPU/iGPU-bound machines -- ~1.1GB vs the 24B's ~14GB. Real tradeoff:
+# weaker legal reasoning/citation accuracy. To use the 24B instead, replace
+# this line (and the matching LEGAL_MODEL constant in app/main.py and
+# app/ui.py) with: ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
+Write-Host "Pulling hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M (Legal tab model, ~1.1GB)..." -ForegroundColor Yellow
+ollama pull hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M
 
 # ---------------------------------------------------------------------------
 # 5. Download + convert MADLAD-400 to CTranslate2 format (one-time, needs internet)
