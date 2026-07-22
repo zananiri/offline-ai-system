@@ -32,17 +32,22 @@ app = FastAPI(title="Offline Translator + Document OCR")
 OLLAMA_MODEL = "qwen2.5:7b-instruct-q4_K_M"
 
 # Backs the Legal tab. Must be pulled once via:
-#   ollama pull hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M
+#   ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
 # (setup.ps1 does this for you.) NOTE: this string is duplicated in
 # app/ui.py (which only talks to this backend over HTTP and can't share a
 # Python constant with it) — keep the two in sync if you change the model.
 #
-# Swapped from the 24B variant to this 1.7B one for speed on CPU/iGPU-bound
-# machines -- it's the smallest size Dicta publishes for this family (24B,
-# 12B, 1.7B), so this is as fast as a DictaLM "thinking" model gets. Real
-# tradeoff: noticeably weaker legal reasoning/citation accuracy than the 24B.
-# To go back, just restore the line above (after re-pulling the 24B model).
-LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
+# Upgraded from the 1.7B variant to this 24B flagship for noticeably
+# stronger legal reasoning/citations. Q4_K_M is a ~14.3GB file -- fits a
+# 32GB-RAM offline machine with room for the OS and this app's other models,
+# but it's the biggest thing this app loads and CPU generation is
+# correspondingly slower (see _OLLAMA_REQUEST_TIMEOUT_SECONDS below, raised
+# to match). If you're tight on RAM alongside other big models this app
+# loads at the same time (translation, batch invoice OCR), drop to the
+# smaller IQ4_XS quant (~12.8GB, same repo) or fall back to the line below.
+# Previous (faster, weaker) setting, kept here for an easy revert:
+#   LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
+LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M"
 
 # ollama-python's module-level ollama.chat(...) convenience function uses a
 # default client built with `timeout=None` -- i.e. NO request timeout at
@@ -62,7 +67,13 @@ LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 #   2. This client's `timeout=` -- a much larger outer safety net, in case
 #      something is actually stuck (not just slow) and never returns at all
 #      even within its token budget.
-_OLLAMA_REQUEST_TIMEOUT_SECONDS = 1800  # 30 min -- safety net, not the normal path
+_OLLAMA_REQUEST_TIMEOUT_SECONDS = 3600  # 60 min -- safety net, not the normal path.
+# Raised from 30 to 60 min for the Legal tab's move to DictaLM-3.0-24B-
+# Thinking (see ui.py's LEGAL_MODEL comment): on CPU, a 24B dense model
+# generating up to _LEGAL_NUM_PREDICT (6144) tokens can genuinely take tens
+# of minutes. This is a single shared client (used by every model this app
+# calls), so the bump also applies to the default chat model -- harmless,
+# since it's a ceiling, not something normal requests are expected to hit.
 _DEFAULT_NUM_PREDICT = 4096  # ~7-14 min of generation at the ~5-9 tok/s seen on this hardware
 _ollama_client = ollama.Client(timeout=_OLLAMA_REQUEST_TIMEOUT_SECONDS)
 

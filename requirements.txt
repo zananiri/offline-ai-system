@@ -5,6 +5,14 @@ docling[rapidocr]==2.113.0
 docling-core==2.86.0
 ctranslate2==4.8.1
 ollama==0.6.2
+# NOTE on the Legal tab's model: app/ui.py's LEGAL_MODEL was upgraded from
+# DictaLM-3.0-1.7B-Thinking to the 24B-Thinking flagship (Q4_K_M, ~14.3GB)
+# for better legal reasoning/citations on a 32GB-RAM offline machine. This
+# is a pure Ollama model swap (`ollama pull hf.co/dicta-il/DictaLM-3.0-24B-
+# Thinking-GGUF:Q4_K_M` — see ui.py's comment for the exact command and the
+# smaller IQ4_XS fallback if you're tight on RAM) and needs no pip package
+# changes at all: the ollama pin above is unaffected, since the Python
+# client just talks to whatever model name it's given.
 
 # Tier 2: used once, offline, for the MADLAD-400 conversion step only
 # (kept loose on purpose — these are never imported at runtime by the app,

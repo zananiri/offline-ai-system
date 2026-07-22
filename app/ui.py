@@ -84,23 +84,37 @@ def _chat_backend(messages, model=None, num_predict=None, num_ctx=None, timeout=
 # app/main.py (ui.py only talks to that backend over HTTP, so it can't
 # import a shared Python constant from it) — keep the two in sync if you
 # change the model. Must be pulled once via:
-#   ollama pull hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M
+#   ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
 #
-# Swapped from 24B to 1.7B (Dicta's smallest size for this family) for speed
-# on CPU/iGPU-bound machines. Real tradeoff: weaker legal reasoning/citation
-# accuracy than the 24B — revert this line (and re-pull the 24B model) if
-# quality matters more than speed for your use case.
-LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
+# Upgraded from the 1.7B model to Dicta's 24B flagship for noticeably
+# stronger legal reasoning and more reliable citations. Q4_K_M quantization
+# is a ~14.3GB download/on-disk file. On a 32GB-RAM, offline/CPU (or
+# modest-iGPU) machine this fits with room to spare for the OS and the rest
+# of this app's own memory use (docling, the MADLAD-400 translation model,
+# etc.) -- but it's the biggest single thing this app loads, so:
+#   - Real tradeoff vs. the 1.7B: much slower generation (CPU tok/s roughly
+#     tracks parameter count, so expect noticeably fewer tokens/sec than the
+#     1.7B's ~20 tok/s -- see the timeout constants below, which were raised
+#     accordingly).
+#   - If you're running the Legal tab at the same time as a large translation
+#     or batch-invoice job (i.e. multiple big models resident at once) and
+#     see swapping/OOM, drop to the smaller IQ4_XS quant instead (~12.8GB:
+#     hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:IQ4_XS), or fall back to
+#     the 1.7B line below.
+# Previous (faster, weaker) setting, kept here for an easy revert:
+#   LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
+LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M"
 
 # See main.py's _DEFAULT_NUM_PREDICT comment for the full story: with no cap
 # at all, a "thinking" model on a broad question can run for as long as it
-# wants (DictaLM-3.0-1.7B-Thinking has a native 65k-token context, so there's
-# no natural ceiling either -- confirmed in practice: a real question about
-# the Clean Air Law ran 1500+s and 13k+ tokens with no end in sight). This
-# is more generous than the backend's own 4096-token default since thinking
-# + a citation for every claim genuinely needs more room, but it's still a
-# hard cap -- if it's hit mid-thought, _strip_thinking (main.py) turns that
-# into a clear "ran out of space" message instead of hanging forever.
+# wants (DictaLM-3.0-24B-Thinking has a native 65k-token context, so there's
+# no natural ceiling either -- confirmed in practice with the 1.7B model: a
+# real question about the Clean Air Law ran 1500+s and 13k+ tokens with no
+# end in sight, and the 24B is slower still). This is more generous than the
+# backend's own 4096-token default since thinking + a citation for every
+# claim genuinely needs more room, but it's still a hard cap -- if it's hit
+# mid-thought, _strip_thinking (main.py) turns that into a clear "ran out of
+# space" message instead of hanging forever.
 _LEGAL_NUM_PREDICT = 6144
 # _LEGAL_NUM_PREDICT only works as an actual ceiling if the model's context
 # window is at least that big -- see main.py's _num_ctx_for comment. Without
@@ -109,12 +123,17 @@ _LEGAL_NUM_PREDICT = 6144
 # (this is what "ran 1500+s and 13k+ tokens with no end in sight" on a Clean
 # Air Law question actually was). Sized for num_predict (6144) + the system
 # prompt + chat history + a full MAX_CONTEXT_CHARS-sized attached document,
-# with headroom -- comfortably under DictaLM-3.0-1.7B-Thinking's native 65k.
+# with headroom -- comfortably under DictaLM-3.0-24B-Thinking's native 65k.
+# (Note: KV cache at this context size adds real memory on top of the 14.3GB
+# weights -- a few more GB. Lower this if you're tight on RAM alongside
+# other models this app loads.)
 _LEGAL_NUM_CTX = 16384
-# Comfortably above the backend's own 1800s safety-net timeout (main.py's
+# Comfortably above the backend's own safety-net timeout (main.py's
 # _OLLAMA_REQUEST_TIMEOUT_SECONDS), so that backend's clearer error message
-# surfaces first instead of a generic timeout here.
-_LEGAL_REQUEST_TIMEOUT_SECONDS = 1900
+# surfaces first instead of a generic timeout here. Raised well past the
+# 1.7B-era value: on CPU, a 24B dense model generating up to 6144 tokens can
+# genuinely take tens of minutes rather than single-digit minutes.
+_LEGAL_REQUEST_TIMEOUT_SECONDS = 3700
 
 LEGAL_SYSTEM_PROMPT = (
     "You are an Israeli lawyer. Think through and answer every question strictly "
