@@ -34,7 +34,6 @@ import pypdfium2 as pdfium
 import pytesseract
 from pytesseract import Output
 from PIL import Image
-from pypdf import PdfReader
 from docx import Document as DocxDocument
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
@@ -170,7 +169,7 @@ _MIN_NATIVE_TEXT_CHARS = 200
 
 def _extract_native_pdf_text(file_path: str) -> str | None:
     """
-    Extracts a PDF's own embedded text layer directly via pypdf -- no
+    Extracts a PDF's own embedded text layer directly via pypdfium2 -- no
     rendering or OCR involved at all. Many "PDFs" -- especially browser
     Print-to-PDF output, which is exactly what government/news pages
     saved as PDF usually are -- already contain a perfect, digitally
@@ -189,12 +188,44 @@ def _extract_native_pdf_text(file_path: str) -> str | None:
     already guards against (some Hebrew PDFs have a text layer where a
     meaningful share of glyphs decode to garbage/Latin-lookalike
     characters; that's not trustworthy to use verbatim either).
+
+    IMPORTANT: this deliberately uses pypdfium2, not pypdf, to pull the text.
+    pypdf's extract_text() walks the content stream's glyph-positioning
+    operators and concatenates them as-is -- for many RTL-authored PDFs
+    (very much including government/browser Print-to-PDF output) that
+    stream lists glyphs in *visual* left-to-right layout order, and pypdf
+    never runs a bidi reordering pass to recover logical reading order from
+    it. The result: every individual character/word is correct, but words
+    within a line come out back-to-front (confirmed directly -- reversing
+    the word order of a "failed" chunk by hand turns it into a correct
+    Hebrew sentence). Because the text still *looks* right in any bidi-aware
+    viewer (which reorders it again for display), this was invisible until
+    it hit a model that reads raw logical order, i.e. MADLAD-400 here.
+    pypdfium2 wraps PDFium (the engine behind Chrome's PDF viewer), whose
+    text-extraction API returns logical reading order directly, so no
+    manual reordering is needed. pypdf is still used elsewhere (ui.py, for
+    structural page splitting) where glyph order never matters.
     """
     try:
-        reader = PdfReader(file_path)
-        text = "\n\n".join(page.extract_text() or "" for page in reader.pages).strip()
+        pdf = pdfium.PdfDocument(file_path)
     except Exception:
         return None
+
+    page_texts = []
+    try:
+        for page in pdf:
+            textpage = page.get_textpage()
+            try:
+                page_texts.append(textpage.get_text_range())
+            finally:
+                textpage.close()
+                page.close()
+    except Exception:
+        return None
+    finally:
+        pdf.close()
+
+    text = "\n\n".join(page_texts).strip()
     if len(text) < _MIN_NATIVE_TEXT_CHARS:
         return None
 
@@ -319,15 +350,25 @@ def _sample_text_hebrew_ratio(file_path: str, max_pages: int = 5) -> float | Non
     to image-based script detection instead.
     """
     try:
-        reader = PdfReader(file_path)
+        pdf = pdfium.PdfDocument(file_path)
     except Exception:
         return None
+
     text_parts = []
-    for page in reader.pages[:max_pages]:
-        try:
-            text_parts.append(page.extract_text() or "")
-        except Exception:
-            continue
+    try:
+        for i in range(min(max_pages, len(pdf))):
+            page = pdf[i]
+            textpage = page.get_textpage()
+            try:
+                text_parts.append(textpage.get_text_range())
+            finally:
+                textpage.close()
+                page.close()
+    except Exception:
+        pass
+    finally:
+        pdf.close()
+
     sample = "".join(text_parts)
     letters = [ch for ch in sample if ch.isalpha()]
     if not letters:
