@@ -19,6 +19,67 @@ from app.document import chunk_text
 
 BACKEND_URL = "http://localhost:8000"
 
+# Matches (and pads slightly past) main.py's own _OLLAMA_REQUEST_TIMEOUT_SECONDS,
+# so this client never gives up before the backend's own safety-net timeout
+# would already have returned a clean error. Without this, requests has no
+# default timeout at all -- a stuck/slow "thinking" model call just hangs
+# the whole Gradio UI indefinitely with zero feedback (confirmed in
+# practice: a Clean Air Law question to DictaLM ran 1500+s and 13k+ tokens
+# with no sign of stopping before main.py's num_predict cap was added).
+_CHAT_TIMEOUT_SECONDS = 1830
+
+
+def _chat_backend(messages, model=None, num_predict=None, num_ctx=None, timeout=None, timeout_hint=None):
+    """
+    POSTs to the backend's /chat endpoint and returns the response content
+    as a plain string. Raises RuntimeError with a clean, user-facing message
+    on any failure (backend unreachable, timed out, or a clean error detail
+    the backend itself already generated) -- callers decide what to do with
+    that: show it as the reply (chat_fn/legal_chat_fn), or fall back
+    gracefully without losing other already-successful work (process()'s
+    summarizer step, where a failed summary shouldn't also take down the
+    translated text that already succeeded).
+
+    timeout/timeout_hint let a caller override the default for a model that
+    needs more room (see legal_chat_fn, which passes a larger timeout and a
+    more specific hint tailored to a "thinking" model on a broad question).
+
+    num_ctx lets a caller request a bigger context window than the backend's
+    own default -- see main.py's _num_ctx_for comment for why this matters:
+    without it, num_predict isn't a real ceiling for a big-num_predict
+    caller like legal_chat_fn, since Ollama's smaller default context window
+    fills up first and the model keeps going via context-shifting instead of
+    stopping cleanly.
+    """
+    payload = {"messages": messages}
+    if model:
+        payload["model"] = model
+    if num_predict:
+        payload["num_predict"] = num_predict
+    if num_ctx:
+        payload["num_ctx"] = num_ctx
+    timeout = timeout or _CHAT_TIMEOUT_SECONDS
+    try:
+        resp = requests.post(f"{BACKEND_URL}/chat", json=payload, timeout=timeout)
+    except requests.exceptions.Timeout:
+        hint = timeout_hint or "try a shorter question or a smaller attached document."
+        raise RuntimeError(
+            f"The model didn't respond within {timeout // 60} minutes. "
+            f"It may be stuck, or just very slow on this hardware -- {hint}"
+        )
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Couldn't reach the backend: {e}")
+
+    if not resp.ok:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(detail)
+
+    return resp.json()["content"]
+
+
 # Model backing the Legal tab. NOTE: this string is duplicated in
 # app/main.py (ui.py only talks to that backend over HTTP, so it can't
 # import a shared Python constant from it) — keep the two in sync if you
@@ -30,6 +91,30 @@ BACKEND_URL = "http://localhost:8000"
 # accuracy than the 24B — revert this line (and re-pull the 24B model) if
 # quality matters more than speed for your use case.
 LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
+
+# See main.py's _DEFAULT_NUM_PREDICT comment for the full story: with no cap
+# at all, a "thinking" model on a broad question can run for as long as it
+# wants (DictaLM-3.0-1.7B-Thinking has a native 65k-token context, so there's
+# no natural ceiling either -- confirmed in practice: a real question about
+# the Clean Air Law ran 1500+s and 13k+ tokens with no end in sight). This
+# is more generous than the backend's own 4096-token default since thinking
+# + a citation for every claim genuinely needs more room, but it's still a
+# hard cap -- if it's hit mid-thought, _strip_thinking (main.py) turns that
+# into a clear "ran out of space" message instead of hanging forever.
+_LEGAL_NUM_PREDICT = 6144
+# _LEGAL_NUM_PREDICT only works as an actual ceiling if the model's context
+# window is at least that big -- see main.py's _num_ctx_for comment. Without
+# this, Ollama's default 4096-token window fills up before num_predict does
+# and the model keeps decoding via context-shifting instead of stopping
+# (this is what "ran 1500+s and 13k+ tokens with no end in sight" on a Clean
+# Air Law question actually was). Sized for num_predict (6144) + the system
+# prompt + chat history + a full MAX_CONTEXT_CHARS-sized attached document,
+# with headroom -- comfortably under DictaLM-3.0-1.7B-Thinking's native 65k.
+_LEGAL_NUM_CTX = 16384
+# Comfortably above the backend's own 1800s safety-net timeout (main.py's
+# _OLLAMA_REQUEST_TIMEOUT_SECONDS), so that backend's clearer error message
+# surfaces first instead of a generic timeout here.
+_LEGAL_REQUEST_TIMEOUT_SECONDS = 1900
 
 LEGAL_SYSTEM_PROMPT = (
     "You are an Israeli lawyer. Think through and answer every question strictly "
@@ -44,6 +129,10 @@ LEGAL_SYSTEM_PROMPT = (
     "not confident of the exact statute, section number, or case citation, say "
     "so explicitly instead of inventing one -- a wrong or fabricated citation "
     "is worse than admitting uncertainty.\n\n"
+    "Keep your answer proportionate to the question: for a broad or general "
+    "topic, cover the most important, directly relevant points rather than "
+    "exhaustively enumerating every provision of a law -- you can offer to go "
+    "deeper on a specific part if the user wants that.\n\n"
     "You are not a substitute for advice from a licensed attorney, and you "
     "should say so when a question calls for one. Always reply in the same "
     "language the user's question is written in -- e.g. if they write in "
@@ -72,6 +161,45 @@ _NO_CITATION_NOTE = (
     "or case. Treat it as general information only and verify against the "
     "actual legislation or with a licensed attorney before relying on it.*"
 )
+
+# Splits an answer into sentence-ish chunks so _extract_citations can pull
+# out the whole sentence around a citation match (not just the bare
+# "Section 1" fragment _LEGAL_CITATION_RE matches on its own) -- that's what
+# actually gets shown in the sidebar panel. Handles Hebrew sentence-enders
+# too, plus plain newlines (the model often puts one citation per line).
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+_CITATIONS_PLACEHOLDER = (
+    "_No citations detected yet. Once you ask a question, any statute, "
+    "regulation, or case citation the model includes in its answer will be "
+    "listed here for easy review._"
+)
+_CITATIONS_NONE_FOUND = (
+    "_This answer didn't include anything citation-shaped. See the "
+    "warning in the chat -- treat it as general information only._"
+)
+
+
+def _extract_citations(answer: str) -> list[str]:
+    """Best-effort pull of citation-bearing sentences out of an answer, for
+    display in the Legal tab's sidebar. Same caveats as _LEGAL_CITATION_RE:
+    this can only detect something citation-shaped, not verify it's real."""
+    seen = set()
+    citations = []
+    for chunk in _SENTENCE_SPLIT_RE.split(answer):
+        sentence = chunk.strip(" -•\t\n")
+        if not sentence or sentence in seen:
+            continue
+        if _LEGAL_CITATION_RE.search(sentence):
+            seen.add(sentence)
+            citations.append(sentence)
+    return citations
+
+
+def _format_citations_panel(citations: list[str]) -> str:
+    if not citations:
+        return _CITATIONS_NONE_FOUND
+    return "\n\n".join(f"- {c}" for c in citations)
 
 # Languages whose script reads right-to-left. Used to flip the translated-text
 # output box's text direction so Arabic/Hebrew results display correctly
@@ -285,9 +413,10 @@ def process(file, source_lang, target_lang, summarize, hebrew_doc, progress=gr.P
             },
             {"role": "user", "content": f"Summarize this in 3-5 bullet points:\n\n{translated_text}"},
         ]
-        resp = requests.post(f"{BACKEND_URL}/chat", json={"messages": messages})
-        resp.raise_for_status()
-        summary = resp.json()["content"]
+        try:
+            summary = _chat_backend(messages)
+        except RuntimeError as e:
+            summary = f"⚠️ Summary failed: {e}"
 
     is_rtl = _is_rtl(target_lang)
     display_text = _anchor_rtl_lines(translated_text) if is_rtl else translated_text
@@ -421,9 +550,10 @@ def chat_fn(message, history, hebrew_doc=False):
         combined_message = user_text
 
     messages = clean_history + [{"role": "user", "content": combined_message}]
-    resp = requests.post(f"{BACKEND_URL}/chat", json={"messages": messages})
-    resp.raise_for_status()
-    return resp.json()["content"]
+    try:
+        return _chat_backend(messages)
+    except RuntimeError as e:
+        return f"⚠️ {e}"
 
 
 def legal_chat_fn(message, history, hebrew_doc=False):
@@ -432,6 +562,11 @@ def legal_chat_fn(message, history, hebrew_doc=False):
     with a light legal-assistant system prompt. Kept as a separate function
     (rather than parameterizing chat_fn) so the two tabs can diverge later
     without threading a model choice through the general Chat tab's UI.
+
+    Returns (answer, citations_panel_markdown) -- the second value feeds the
+    Legal tab's sidebar via gr.ChatInterface's additional_outputs, so any
+    citation-shaped text in the answer shows up as its own list on the
+    right instead of only being visible inline in the chat transcript.
     """
     if isinstance(message, dict):
         user_text = message.get("text", "")
@@ -465,12 +600,19 @@ def legal_chat_fn(message, history, hebrew_doc=False):
         + clean_history
         + [{"role": "user", "content": combined_message}]
     )
-    resp = requests.post(f"{BACKEND_URL}/chat", json={"messages": messages, "model": LEGAL_MODEL})
-    resp.raise_for_status()
-    answer = resp.json()["content"]
-    if not _LEGAL_CITATION_RE.search(answer):
+    try:
+        answer = _chat_backend(
+            messages, model=LEGAL_MODEL, num_predict=_LEGAL_NUM_PREDICT,
+            num_ctx=_LEGAL_NUM_CTX, timeout=_LEGAL_REQUEST_TIMEOUT_SECONDS,
+            timeout_hint="try a narrower question -- e.g. ask about a specific section rather than a whole law.",
+        )
+    except RuntimeError as e:
+        return f"⚠️ {e}", gr.skip()
+
+    citations = _extract_citations(answer)
+    if not citations:
         answer += _NO_CITATION_NOTE
-    return answer
+    return answer, _format_citations_panel(citations)
 
 
 def set_hebrew_from_source_lang(source_lang):
@@ -780,10 +922,22 @@ with gr.Blocks(title=" Ibrahim Zananiri- AI Employee") as demo:
         legal_hebrew_checkbox = gr.Checkbox(
             label="Attached document is in Hebrew (uses Tesseract OCR instead of the default engine)"
         )
-        gr.ChatInterface(
-            fn=legal_chat_fn, type="messages", multimodal=True,
-            additional_inputs=[legal_hebrew_checkbox],
-        )
+        # Defined here (render=False) so it can be passed to ChatInterface's
+        # additional_outputs below, then actually placed in the right-hand
+        # column further down -- gr.ChatInterface requires additional_outputs
+        # to already exist in the same Blocks scope, but we want it to render
+        # in the sidebar, not wherever ChatInterface would put it by default.
+        legal_citations_panel = gr.Markdown(_CITATIONS_PLACEHOLDER, render=False)
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.ChatInterface(
+                    fn=legal_chat_fn, type="messages", multimodal=True,
+                    additional_inputs=[legal_hebrew_checkbox],
+                    additional_outputs=[legal_citations_panel],
+                )
+            with gr.Column(scale=1):
+                gr.Markdown("### 📚 Citations found")
+                legal_citations_panel.render()
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
