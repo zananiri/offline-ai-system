@@ -2,6 +2,7 @@
 Gradio UI — talks to the FastAPI backend at localhost:8000.
 Run after main.py is already running: python -m app.ui
 """
+import base64
 import re
 import tempfile
 import zipfile
@@ -31,10 +32,45 @@ BACKEND_URL = "http://localhost:8000"
 LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 
 LEGAL_SYSTEM_PROMPT = (
-    "You are a legal assistant. Answer clearly, and cite the relevant "
-    "section/clause of any attached document when you rely on it. You are "
-    "not a substitute for advice from a licensed attorney, and you should "
-    "say so when a question calls for one."
+    "You are an Israeli lawyer. Think through and answer every question strictly "
+    "according to the laws of the State of Israel -- its statutes, regulations, "
+    "and case law -- not the law of any other jurisdiction, unless the user "
+    "explicitly asks about a different country's law.\n\n"
+    "For every substantive legal claim, name the specific Israeli statute, "
+    "regulation, or section you are relying on immediately after the claim -- "
+    "for example: 'A contract requires offer and acceptance (Section 1, "
+    "Contracts Law (General Part), 5733-1973).' Also cite the relevant "
+    "section/clause of any attached document when you rely on it. If you are "
+    "not confident of the exact statute, section number, or case citation, say "
+    "so explicitly instead of inventing one -- a wrong or fabricated citation "
+    "is worse than admitting uncertainty.\n\n"
+    "You are not a substitute for advice from a licensed attorney, and you "
+    "should say so when a question calls for one. Always reply in the same "
+    "language the user's question is written in -- e.g. if they write in "
+    "English, your entire answer must be in English, even though the "
+    "underlying law and any attached document may be in Hebrew. Never switch "
+    "languages on the user unasked."
+)
+
+# Best-effort heuristic for "did the answer cite anything at all" -- matches
+# common Israeli-law citation shapes in both English and Hebrew (section/
+# regulation numbers, named statutes, and Hebrew court-ruling abbreviations
+# like בג"ץ/ע"א). This can only detect the ABSENCE of a citation-shaped
+# string; it cannot verify that a citation that IS present is real. Small
+# models are prone to fabricating plausible-looking statute/section numbers,
+# and no regex can catch that -- this is a floor (something was cited),
+# not a correctness guarantee. See legal_chat_fn for how it's used.
+_LEGAL_CITATION_RE = re.compile(
+    r"(סעיף\s*\d+|תקנה\s*\d+|חוק\s+\S+|פסק\s*דין|בג\"?ץ|ע\"?א\s*\d+|"
+    r"\bsection\s+\d+|\bregulation\s+\d+|\barticle\s+\d+|\blaw\s*(\(|,)?\s*(19|20|5[6-9])\d{2}\b|"
+    r"\bhcj\b|\bbasic\s+law\b)",
+    re.IGNORECASE,
+)
+
+_NO_CITATION_NOTE = (
+    "\n\n---\n⚠️ *This answer doesn't appear to cite a specific law, regulation, "
+    "or case. Treat it as general information only and verify against the "
+    "actual legislation or with a licensed attorney before relying on it.*"
 )
 
 # Languages whose script reads right-to-left. Used to flip the translated-text
@@ -69,6 +105,105 @@ def _anchor_rtl_lines(text: str) -> str:
         f"{_RTL_MARK}{line}" if line.strip() else line
         for line in text.split("\n")
     )
+
+
+# --- Document preview (Translate tab's right-hand panel) -------------------
+#
+# There's no single Gradio component that previews every format this app
+# accepts, so three different strategies are used depending on file type:
+#
+#   Images  -> gr.Image with show_fullscreen_button=True. Gives a native
+#              click-to-zoom/pan lightbox for free (same mechanism this
+#              file already uses for the header logo, just switched on).
+#   PDFs    -> embedded via a base64 data: URI inside an <iframe>, so the
+#              browser's own PDF viewer renders it -- built-in zoom, scroll,
+#              page navigation, and print, no extra dependency. A data URI
+#              is used instead of a path-based Gradio static-file URL (e.g.
+#              "/file=...") on purpose: that route's exact prefix differs
+#              across Gradio major versions and only works for paths inside
+#              Gradio's allowed-paths, which is fragile to hardcode. A data
+#              URI works identically regardless of Gradio version.
+#   Other   -> (DOCX, PPTX, etc.) no in-browser renderer exists for these
+#              without extra dependencies, so the existing /extract-text
+#              endpoint is reused to show the extracted text instead. Not a
+#              visual preview, but it directly shows what's about to be
+#              translated, and costs nothing extra: DOCX/PPTX never go
+#              through OCR (see document.py), so this second extraction
+#              call is fast.
+_PREVIEW_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+
+# Above this, base64-inlining the whole file into the page's HTML would
+# bloat the page enough to feel sluggish -- fall back to a plain notice
+# instead of a broken/slow preview. Translation itself is unaffected either
+# way; this only gates the preview panel.
+_MAX_INLINE_PREVIEW_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _pdf_preview_html(path: Path) -> str:
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    data_uri = f"data:application/pdf;base64,{b64}"
+    return f"""
+<div style="border:1px solid var(--border-color-primary, #ddd); border-radius:8px; overflow:hidden;">
+  <iframe src="{data_uri}" style="width:100%; height:520px; border:none;"></iframe>
+</div>
+<p style="text-align:center; margin-top:6px;">
+  <a href="{data_uri}" target="_blank" rel="noopener">🔍 Open full preview in a new tab (zoom, scroll, print)</a>
+</p>
+"""
+
+
+def build_preview(file):
+    """
+    Builds a live preview of the uploaded document for the panel on the
+    right of the Translate tab. Wired to file_in.change, so it fires the
+    moment a file is picked (or cleared) -- independent of clicking
+    Translate -- letting the user confirm it's the right document before
+    running anything.
+
+    The whole preview column is hidden by default and only made visible
+    once a file is actually present, and hidden again when the file is
+    cleared -- there's no "upload a document" placeholder state, the panel
+    simply isn't there until there's something to show.
+
+    Returns a 4-tuple of gr.update(...) for (preview_column, image_preview,
+    pdf_preview_html, text_preview). Within the column, exactly one of the
+    three preview components is made visible at a time (text_preview also
+    doubles as the spot for status/error messages, e.g. an oversized PDF
+    or a failed extraction).
+    """
+    hidden = gr.update(visible=False)
+
+    if file is None:
+        return gr.update(visible=False), hidden, hidden, hidden
+
+    path = Path(file.name)
+    suffix = path.suffix.lower()
+
+    if suffix in _PREVIEW_IMAGE_EXTS:
+        return gr.update(visible=True), gr.update(value=str(path), visible=True), hidden, hidden
+
+    if suffix == ".pdf":
+        size = path.stat().st_size
+        if size > _MAX_INLINE_PREVIEW_BYTES:
+            msg = (
+                f"⚠️ This PDF is {size / 1_048_576:.1f} MB, too large to preview inline. "
+                "It will still be translated normally -- the preview panel just skips it."
+            )
+            return gr.update(visible=True), hidden, hidden, gr.update(value=msg, visible=True)
+        return gr.update(visible=True), hidden, gr.update(value=_pdf_preview_html(path), visible=True), hidden
+
+    # DOCX/PPTX/etc. -- no visual renderer available, fall back to extracted text.
+    try:
+        with open(path, "rb") as f:
+            resp = requests.post(f"{BACKEND_URL}/extract-text", files={"file": f}, data={"hebrew": False})
+        resp.raise_for_status()
+        text = resp.json().get("markdown", "")
+    except Exception as e:
+        return gr.update(visible=True), hidden, hidden, gr.update(value=f"⚠️ Couldn't build a preview: {e}", visible=True)
+
+    if not text.strip():
+        return gr.update(visible=True), hidden, hidden, gr.update(value="(no previewable text found in this document)", visible=True)
+    return gr.update(visible=True), hidden, hidden, gr.update(value=text, visible=True)
 
 
 def process(file, source_lang, target_lang, summarize, hebrew_doc, progress=gr.Progress()):
@@ -332,7 +467,10 @@ def legal_chat_fn(message, history, hebrew_doc=False):
     )
     resp = requests.post(f"{BACKEND_URL}/chat", json={"messages": messages, "model": LEGAL_MODEL})
     resp.raise_for_status()
-    return resp.json()["content"]
+    answer = resp.json()["content"]
+    if not _LEGAL_CITATION_RE.search(answer):
+        answer += _NO_CITATION_NOTE
+    return answer
 
 
 def set_hebrew_from_source_lang(source_lang):
@@ -518,32 +656,52 @@ with gr.Blocks(title=" Ibrahim Zananiri- AI Employee") as demo:
         gr.Markdown("# Clara - LPJ AI Agent \n### By Ibrahim Zananiri")
 
     with gr.Tab("Translate"):
-        file_in = gr.File(label="Upload document (PDF, DOCX, PPTX, image)")
         with gr.Row():
-            src = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Source language", value="english")
-            tgt = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Target language", value="spanish")
-            summarize = gr.Checkbox(label="Also summarize with AI")
-        hebrew_doc_translate = gr.State(value=False)
-        hebrew_status_translate = gr.Markdown(value="", visible=False)
-        src.change(
-            set_hebrew_from_source_lang,
-            inputs=[src],
-            outputs=[hebrew_doc_translate, hebrew_status_translate],
-        )
-        run_btn = gr.Button("Translate")
-        output_text = gr.Textbox(label="Translated text", lines=20, rtl=_is_rtl(tgt.value))
-        tgt.change(
-            lambda target_lang: gr.update(rtl=_is_rtl(target_lang)),
-            inputs=[tgt],
-            outputs=[output_text],
-        )
-        ocr_engine_out = gr.Textbox(label="OCR engine (used if the document needed OCR)", interactive=False)
-        output_summary = gr.Textbox(label="Summary (if requested)", lines=5)
-        run_btn.click(
-            process,
-            inputs=[file_in, src, tgt, summarize, hebrew_doc_translate],
-            outputs=[output_text, ocr_engine_out, output_summary],
-        )
+            with gr.Column(scale=3):
+                file_in = gr.File(label="Upload document (PDF, DOCX, PPTX, image)")
+                with gr.Row():
+                    src = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Source language", value="english")
+                    tgt = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Target language", value="spanish")
+                    summarize = gr.Checkbox(label="Also summarize with AI")
+                hebrew_doc_translate = gr.State(value=False)
+                hebrew_status_translate = gr.Markdown(value="", visible=False)
+                src.change(
+                    set_hebrew_from_source_lang,
+                    inputs=[src],
+                    outputs=[hebrew_doc_translate, hebrew_status_translate],
+                )
+                run_btn = gr.Button("Translate")
+                output_text = gr.Textbox(
+                    label="Translated text", lines=20, rtl=_is_rtl(tgt.value), show_copy_button=True,
+                )
+                tgt.change(
+                    lambda target_lang: gr.update(rtl=_is_rtl(target_lang)),
+                    inputs=[tgt],
+                    outputs=[output_text],
+                )
+                ocr_engine_out = gr.Textbox(label="OCR engine (used if the document needed OCR)", interactive=False)
+                output_summary = gr.Textbox(label="Summary (if requested)", lines=5)
+                run_btn.click(
+                    process,
+                    inputs=[file_in, src, tgt, summarize, hebrew_doc_translate],
+                    outputs=[output_text, ocr_engine_out, output_summary],
+                )
+
+            with gr.Column(scale=2, visible=False) as preview_column:
+                gr.Markdown("### Document preview")
+                preview_image = gr.Image(
+                    label="Preview", visible=False, interactive=False,
+                    show_fullscreen_button=True, height=520,
+                )
+                preview_pdf_html = gr.HTML(visible=False)
+                preview_text = gr.Textbox(
+                    label="Preview", visible=False, lines=20, interactive=False,
+                )
+                file_in.change(
+                    build_preview,
+                    inputs=[file_in],
+                    outputs=[preview_column, preview_image, preview_pdf_html, preview_text],
+                )
 
     with gr.Tab("Convert to Word"):
         gr.Markdown("Upload a PDF (native or scanned) or an image — text is extracted "
@@ -611,10 +769,13 @@ with gr.Blocks(title=" Ibrahim Zananiri- AI Employee") as demo:
     with gr.Tab("Legal"):
         gr.Markdown(
             "Chat with the local Hebrew-legal model "
-            "(**DictaLM-3.0-24B-Thinking**, served via Ollama). Attach a PDF, DOCX, "
+            "(**DictaLM-3.0-1.7B-Thinking**, served via Ollama). Attach a PDF, DOCX, "
             "PPTX, or image and ask questions about it — text (with OCR if needed) "
             "is extracted and given to the model as context.\n\n"
-            "⚠️ This is not a substitute for advice from a licensed attorney."
+            "⚠️ This is not a substitute for advice from a licensed attorney. "
+            "Citations to specific laws, sections, or cases should be independently "
+            "verified — small local models can occasionally cite a law or section "
+            "that doesn't actually exist."
         )
         legal_hebrew_checkbox = gr.Checkbox(
             label="Attached document is in Hebrew (uses Tesseract OCR instead of the default engine)"

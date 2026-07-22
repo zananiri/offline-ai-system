@@ -50,6 +50,33 @@ LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 # If DictaLM turns out to use a different wrapper tag, update this regex.
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
+# Fallback for a <think> tag that was opened but never closed -- happens
+# when the model runs out of its context/token budget mid-reasoning (a real
+# risk for "thinking" models on long prompts, e.g. a legal question with a
+# big attached document pushing the request near the model's context
+# limit). _THINK_BLOCK_RE requires a matching close tag, so on its own it
+# silently leaves the entire raw, unfinished chain-of-thought in place --
+# which then renders in the chat UI as if it were the actual answer.
+_UNCLOSED_THINK_RE = re.compile(r"<think>.*", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_thinking(content: str) -> str:
+    """Removes a thinking model's <think>...</think> block. Handles both a
+    normal, fully-closed block and one truncated by a token/context limit
+    (see _UNCLOSED_THINK_RE above) -- in the latter case there's no real
+    answer to recover, so that's surfaced as an explicit note instead of
+    dumping the raw, unfinished reasoning on the user."""
+    stripped = _THINK_BLOCK_RE.sub("", content).strip()
+    if "<think>" in stripped.lower():
+        stripped = _UNCLOSED_THINK_RE.sub("", stripped).strip()
+        if not stripped:
+            stripped = (
+                "_(The model ran out of space while reasoning and never "
+                "reached an answer. Try a shorter question or a smaller "
+                "attached document.)_"
+            )
+    return stripped
+
 
 def _convert_to_markdown_or_503(path: str, hebrew: bool) -> str:
     try:
@@ -147,9 +174,25 @@ async def chat(payload: dict):
     """
     messages = payload.get("messages", [])
     model = payload.get("model") or OLLAMA_MODEL
-    response = ollama.chat(model=model, messages=messages)
+    try:
+        response = ollama.chat(model=model, messages=messages)
+    except ConnectionError as e:
+        # ollama-python already turns "daemon not running/reachable" into a
+        # plain ConnectionError with a friendly message -- pass it straight
+        # through rather than letting FastAPI turn it into a raw 500.
+        raise HTTPException(status_code=503, detail=str(e))
+    except ollama.ResponseError as e:
+        if e.status_code == 404:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Model '{model}' isn't pulled in Ollama yet. Run: "
+                    f"ollama pull {model}"
+                ),
+            )
+        raise HTTPException(status_code=502, detail=str(e))
     content = response["message"]["content"]
-    content = _THINK_BLOCK_RE.sub("", content).strip()
+    content = _strip_thinking(content)
     return {"content": content}
 
 
