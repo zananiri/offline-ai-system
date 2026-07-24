@@ -14,6 +14,11 @@ import openpyxl
 from openpyxl.styles import Font
 from pypdf import PdfReader, PdfWriter
 
+try:
+    import chromadb
+except ImportError:
+    chromadb = None  # Canon AI tab degrades to a clear error message if this isn't installed
+
 from app.translate import LANGUAGES
 from app.document import chunk_text
 
@@ -104,6 +109,14 @@ def _chat_backend(messages, model=None, num_predict=None, num_ctx=None, timeout=
 # Previous (faster, weaker) setting, kept here for an easy revert:
 #   LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M"
+
+# Backs the separate "Attorney 1.7B" tab (see legal_chat_fn_1_7b below) --
+# Dicta's smallest model in this family, kept alongside the 24B as a fast
+# option rather than a replacement for it. NOT pulled by setup.ps1/
+# install.txt -- pull it manually once, same venv active:
+#   ollama pull hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M
+# (~1.1GB download; confirm it landed with `ollama list`)
+LEGAL_MODEL_1_7B = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 
 # See main.py's _DEFAULT_NUM_PREDICT comment for the full story: with no cap
 # at all, a "thinking" model on a broad question can run for as long as it
@@ -577,7 +590,7 @@ def chat_fn(message, history, hebrew_doc=False):
 
 def legal_chat_fn(message, history, hebrew_doc=False):
     """
-    Same shape as chat_fn, but routed to LEGAL_MODEL (DictaLM-3.0-1.7B-Thinking)
+    Same shape as chat_fn, but routed to LEGAL_MODEL (DictaLM-3.0-24B-Thinking)
     with a light legal-assistant system prompt. Kept as a separate function
     (rather than parameterizing chat_fn) so the two tabs can diverge later
     without threading a model choice through the general Chat tab's UI.
@@ -632,6 +645,297 @@ def legal_chat_fn(message, history, hebrew_doc=False):
     if not citations:
         answer += _NO_CITATION_NOTE
     return answer, _format_citations_panel(citations)
+
+
+def legal_chat_fn_1_7b(message, history, hebrew_doc=False):
+    """
+    Identical to legal_chat_fn, routed to LEGAL_MODEL_1_7B (DictaLM-3.0-1.7B-
+    Thinking) instead of the 24B flagship. Kept as a fully separate function
+    (rather than a model parameter on legal_chat_fn) so the "Attorney 24B"
+    and "Attorney 1.7B" tabs stay independently editable, same reasoning as
+    legal_chat_fn's own docstring for why it isn't folded into chat_fn.
+
+    Reuses _LEGAL_NUM_PREDICT/_LEGAL_NUM_CTX/_LEGAL_REQUEST_TIMEOUT_SECONDS
+    as-is -- these were sized for the slower 24B model, so they're safe
+    (generous) upper bounds here too; the 1.7B will simply finish well
+    inside them.
+
+    Returns (answer, citations_panel_markdown) -- see legal_chat_fn.
+    """
+    if isinstance(message, dict):
+        user_text = message.get("text", "")
+        files = message.get("files", []) or []
+    else:
+        user_text = message
+        files = []
+
+    file_context = ""
+    if files:
+        file_context = extract_context_from_files(files, hebrew=hebrew_doc)
+        if len(file_context) > MAX_CONTEXT_CHARS:
+            file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
+
+    clean_history = [
+        {"role": turn["role"], "content": turn["content"]}
+        for turn in history
+        if isinstance(turn.get("content"), str)
+    ]
+
+    if file_context:
+        combined_message = (
+            f"The user attached the following document(s):\n\n{file_context}\n\n"
+            f"User question: {user_text}"
+        )
+    else:
+        combined_message = user_text
+
+    messages = (
+        [{"role": "system", "content": LEGAL_SYSTEM_PROMPT}]
+        + clean_history
+        + [{"role": "user", "content": combined_message}]
+    )
+    try:
+        answer = _chat_backend(
+            messages, model=LEGAL_MODEL_1_7B, num_predict=_LEGAL_NUM_PREDICT,
+            num_ctx=_LEGAL_NUM_CTX, timeout=_LEGAL_REQUEST_TIMEOUT_SECONDS,
+            timeout_hint="try a narrower question -- e.g. ask about a specific section rather than a whole law.",
+        )
+    except RuntimeError as e:
+        return f"⚠️ {e}", gr.skip()
+
+    citations = _extract_citations(answer)
+    if not citations:
+        answer += _NO_CITATION_NOTE
+    return answer, _format_citations_panel(citations)
+
+
+# --- Canon AI (RAG over the Codice di Diritto Canonico, Italian) -----------
+#
+# Unlike the Attorney tabs (which stuff an attached document straight into
+# the prompt), this tab retrieves relevant canons from a local ChromaDB
+# vector store -- built ahead of time by scrape_cic_it.py + embed_to_chroma.py
+# -- and grounds the model's answer in whatever it actually retrieves.
+#
+# Path/collection name here MUST match what embed_to_chroma.py was run
+# with (--chroma-dir / --collection). Adjust if you used different values.
+CANON_CHROMA_DIR = str(Path(__file__).resolve().parent / "chroma_db")
+CANON_COLLECTION_NAME = "cic_it"
+
+# nomic-embed-text via Ollama -- same model/endpoint used to build the
+# collection. Query-time text needs the "search_query: " prefix (NOT
+# "search_document: ", which is what was used when indexing) -- nomic's
+# model was trained with different prefixes for each side of retrieval,
+# and mixing them up silently degrades results rather than erroring.
+_CANON_OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
+_CANON_EMBED_MODEL = "nomic-embed-text"
+_CANON_QUERY_PREFIX = "search_query: "
+
+# How many canons to retrieve per question. Higher = more coverage but
+# more context spent on possibly-irrelevant canons.
+_CANON_TOP_K = 5
+
+# Model that answers using the retrieved canons. Left as None to use
+# whatever the backend's own default chat model is (same as the plain
+# Chat tab) -- set this to a specific Ollama model string (pulled and
+# available to the backend) if you want Canon AI on its own dedicated
+# model instead, e.g. one of the LEGAL_MODEL constants above.
+CANON_MODEL = None
+_CANON_NUM_PREDICT = 2048
+_CANON_REQUEST_TIMEOUT_SECONDS = 900
+
+CANON_SYSTEM_PROMPT = (
+    "You are a canon lawyer -- an attorney specialized in the Roman "
+    "Catholic Church's Codice di Diritto Canonico (Code of Canon Law). "
+    "Think through and answer every question strictly according to the "
+    "canons provided to you below, retrieved from the official Italian "
+    "text on vatican.va -- not from general recall of canon law, and "
+    "not from the law of any civil jurisdiction, unless the user "
+    "explicitly asks about civil law.\n\n"
+    "For every substantive claim, cite the specific canon(s) you are "
+    "relying on immediately after the claim -- for example: 'A parish "
+    "priest is removed only for a grave cause (Can. 1740).' Base your "
+    "answer ONLY on the canons retrieved below plus general background "
+    "knowledge of canon law's structure -- never invent a canon number "
+    "or a rule that isn't in the excerpts you were given. If the "
+    "retrieved canons don't actually answer the question, say so "
+    "explicitly instead of guessing -- a wrong or fabricated citation is "
+    "worse than admitting the retrieval didn't cover it.\n\n"
+    "Keep your answer proportionate to the question: for a broad or "
+    "general topic, cover the most important, directly relevant canons "
+    "rather than exhaustively enumerating every retrieved excerpt -- you "
+    "can offer to go deeper on a specific canon if the user wants that.\n\n"
+    "Note where relevant that Book VI (Cann. 1311-1399) was fully "
+    "reformed in 2021 ('Pascite Gregem Dei') -- flag if a retrieved Book "
+    "VI canon might reflect the pre-2021 text.\n\n"
+    "You are not a substitute for advice from a canon lawyer engaged by "
+    "the person's diocese or tribunal, or for the guidance of competent "
+    "Church authority, and you should say so when a question calls for "
+    "one. Always reply in the same language the user's question is "
+    "written in -- e.g. if they write in English, your entire answer "
+    "must be in English, even though the retrieved canon text is in "
+    "Italian. Never switch languages on the user unasked."
+)
+
+_CANON_SOURCES_PLACEHOLDER = (
+    "_No canons retrieved yet. Once you ask a question, the specific "
+    "canons retrieved from the vector database will be listed here._"
+)
+_CANON_SOURCES_NONE_FOUND = (
+    "_Nothing was retrieved for this question -- the answer above (if any) "
+    "isn't grounded in a specific canon. Try rephrasing._"
+)
+_CANON_DB_MISSING_MSG = (
+    "⚠️ Canon AI's vector database isn't available. Make sure you've run "
+    "scrape_cic_it.py then embed_to_chroma.py (pointed at "
+    f"'{CANON_CHROMA_DIR}', collection '{CANON_COLLECTION_NAME}'), and "
+    "that chromadb is installed (`pip install chromadb`)."
+)
+
+_canon_collection_cache = None
+
+
+def _get_canon_collection():
+    """Lazily connect to the persistent Chroma collection, caching the
+    handle across calls. Returns None (rather than raising) on any
+    failure -- callers surface a clean in-chat error instead of crashing
+    the whole UI process if the vector DB hasn't been built yet."""
+    global _canon_collection_cache
+    if _canon_collection_cache is not None:
+        return _canon_collection_cache
+    if chromadb is None:
+        return None
+    try:
+        client = chromadb.PersistentClient(path=CANON_CHROMA_DIR)
+        _canon_collection_cache = client.get_collection(CANON_COLLECTION_NAME)
+        return _canon_collection_cache
+    except Exception as e:
+        import traceback
+        print(f"[Canon AI] failed to open Chroma collection at "
+              f"'{CANON_CHROMA_DIR}' / '{CANON_COLLECTION_NAME}': {e}")
+        traceback.print_exc()
+        return None
+
+
+def _embed_canon_query(text: str) -> list[float] | None:
+    try:
+        resp = requests.post(
+            _CANON_OLLAMA_EMBED_URL,
+            json={"model": _CANON_EMBED_MODEL, "prompt": _CANON_QUERY_PREFIX + text},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["embedding"]
+    except Exception:
+        return None
+
+
+def retrieve_canons(query: str, n_results: int = _CANON_TOP_K):
+    """
+    Embeds the query with nomic-embed-text and retrieves the closest
+    canons from ChromaDB. Returns (context_text, sources) where sources
+    is a list of dicts used to build the sidebar panel -- or (None, None)
+    on any failure (missing DB, unreachable Ollama, etc.), which callers
+    turn into a clear in-chat message rather than a silent empty answer.
+    """
+    collection = _get_canon_collection()
+    if collection is None:
+        return None, None
+
+    query_vector = _embed_canon_query(query)
+    if query_vector is None:
+        return None, None
+
+    try:
+        results = collection.query(query_embeddings=[query_vector], n_results=n_results)
+    except Exception:
+        return None, None
+
+    documents = (results.get("documents") or [[]])[0]
+    metadatas = (results.get("metadatas") or [[]])[0]
+
+    if not documents:
+        return "", []
+
+    context_parts = []
+    sources = []
+    for doc, meta in zip(documents, metadatas):
+        canon_num = meta.get("canon_number", "?")
+        path = meta.get("hierarchy_path", "")
+        url = meta.get("source_url", "")
+        note = meta.get("in_force_note", "")
+        context_parts.append(f"[Can. {canon_num}] ({path})\n{doc}")
+        sources.append({"canon_number": canon_num, "hierarchy_path": path, "source_url": url, "note": note})
+
+    context_text = "\n\n---\n\n".join(context_parts)
+    return context_text, sources
+
+
+def _format_canon_sources_panel(sources: list[dict] | None) -> str:
+    if not sources:
+        return _CANON_SOURCES_NONE_FOUND
+    lines = []
+    for s in sources:
+        line = f"- **Can. {s['canon_number']}** — {s['hierarchy_path']}"
+        if s.get("source_url"):
+            line += f"  \n  [{s['source_url']}]({s['source_url']})"
+        if s.get("note"):
+            line += f"  \n  ⚠️ {s['note']}"
+        lines.append(line)
+    return "\n\n".join(lines)
+
+
+def canon_chat_fn(message, history):
+    """
+    RAG chat over the scraped/embedded Codice di Diritto Canonico. Not
+    multimodal (no file attachment) -- the whole point of this tab is
+    grounding answers in the pre-built vector database rather than
+    whatever the user happens to attach.
+
+    Returns (answer, sources_panel_markdown) -- see canon_sources_panel's
+    wiring below, same additional_outputs pattern as the Attorney tabs'
+    citations panel.
+    """
+    user_text = message.get("text", message) if isinstance(message, dict) else message
+
+    if chromadb is None or _get_canon_collection() is None:
+        return _CANON_DB_MISSING_MSG, gr.skip()
+
+    context_text, sources = retrieve_canons(user_text)
+    if context_text is None:
+        return _CANON_DB_MISSING_MSG, gr.skip()
+
+    clean_history = [
+        {"role": turn["role"], "content": turn["content"]}
+        for turn in history
+        if isinstance(turn.get("content"), str)
+    ]
+
+    if context_text:
+        combined_message = (
+            f"Retrieved canons relevant to the question:\n\n{context_text}\n\n"
+            f"User question: {user_text}"
+        )
+    else:
+        combined_message = (
+            "No canons were retrieved for this question -- tell the user "
+            f"that plainly instead of guessing.\n\nUser question: {user_text}"
+        )
+
+    messages = (
+        [{"role": "system", "content": CANON_SYSTEM_PROMPT}]
+        + clean_history
+        + [{"role": "user", "content": combined_message}]
+    )
+    try:
+        answer = _chat_backend(
+            messages, model=CANON_MODEL, num_predict=_CANON_NUM_PREDICT,
+            timeout=_CANON_REQUEST_TIMEOUT_SECONDS,
+            timeout_hint="try a narrower question about a specific canon or topic.",
+        )
+    except RuntimeError as e:
+        return f"⚠️ {e}", gr.skip()
+
+    return answer, _format_canon_sources_panel(sources)
 
 
 def set_hebrew_from_source_lang(source_lang):
@@ -927,10 +1231,10 @@ with gr.Blocks(title=" Ibrahim Zananiri- AI Employee") as demo:
             outputs=[report_out, summary_out],
         )
 
-    with gr.Tab("Legal"):
+    with gr.Tab("Attorney 24B"):
         gr.Markdown(
             "Chat with the local Hebrew-legal model "
-            "(**DictaLM-3.0-1.7B-Thinking**, served via Ollama). Attach a PDF, DOCX, "
+            "(**DictaLM-3.0-24B-Thinking**, served via Ollama). Attach a PDF, DOCX, "
             "PPTX, or image and ask questions about it — text (with OCR if needed) "
             "is extracted and given to the model as context.\n\n"
             "⚠️ This is not a substitute for advice from a licensed attorney. "
@@ -957,6 +1261,55 @@ with gr.Blocks(title=" Ibrahim Zananiri- AI Employee") as demo:
             with gr.Column(scale=1):
                 gr.Markdown("### 📚 Citations found")
                 legal_citations_panel.render()
+
+    with gr.Tab("Attorney 1.7B"):
+        gr.Markdown(
+            "Chat with the local Hebrew-legal model "
+            "(**DictaLM-3.0-1.7B-Thinking**, served via Ollama). Attach a PDF, DOCX, "
+            "PPTX, or image and ask questions about it — text (with OCR if needed) "
+            "is extracted and given to the model as context.\n\n"
+            "⚠️ This is not a substitute for advice from a licensed attorney. "
+            "Citations to specific laws, sections, or cases should be independently "
+            "verified — small local models can occasionally cite a law or section "
+            "that doesn't actually exist. This is the smaller/faster 1.7B model, so "
+            "it's weaker on legal reasoning and citation accuracy than Attorney 24B."
+        )
+        legal_hebrew_checkbox_1_7b = gr.Checkbox(
+            label="Attached document is in Hebrew (uses Tesseract OCR instead of the default engine)"
+        )
+        legal_citations_panel_1_7b = gr.Markdown(_CITATIONS_PLACEHOLDER, render=False)
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.ChatInterface(
+                    fn=legal_chat_fn_1_7b, type="messages", multimodal=True,
+                    additional_inputs=[legal_hebrew_checkbox_1_7b],
+                    additional_outputs=[legal_citations_panel_1_7b],
+                )
+            with gr.Column(scale=1):
+                gr.Markdown("### 📚 Citations found")
+                legal_citations_panel_1_7b.render()
+
+    with gr.Tab("Canon AI"):
+        gr.Markdown(
+            "Chat about the **Codice di Diritto Canonico** (Code of Canon "
+            "Law), grounded in a local vector database built from the "
+            "official Italian text on vatican.va (RAG — Retrieval-"
+            "Augmented Generation via ChromaDB + nomic-embed-text).\n\n"
+            "⚠️ Answers are only as good as what's retrieved. This is not "
+            "a substitute for a canon lawyer or the guidance of competent "
+            "Church authority. Always verify against the actual canon "
+            "text (linked in Sources) for anything consequential."
+        )
+        canon_sources_panel = gr.Markdown(_CANON_SOURCES_PLACEHOLDER, render=False)
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.ChatInterface(
+                    fn=canon_chat_fn, type="messages",
+                    additional_outputs=[canon_sources_panel],
+                )
+            with gr.Column(scale=1):
+                gr.Markdown("### 📖 Canons retrieved")
+                canon_sources_panel.render()
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)

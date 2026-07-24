@@ -17,6 +17,9 @@ powershellollama serve
 New tab:
 powershell.\.venv\Scripts\Activate.ps1
 ollama pull qwen2.5:7b-instruct-q4_K_M
+ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
+(this second one is the Legal tab's model -- LEGAL_MODEL in app/main.py and
+app/ui.py -- ~14.3GB, easy to forget since it's not the default chat model)
 6. Get the MADLAD-400 model onto the new machine:
 
 If you copied BOTH models/madlad400-ct2/ AND models/madlad400-tokenizer/ already → skip this step entirely.
