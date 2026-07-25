@@ -1141,6 +1141,16 @@ def process_invoices(uploaded_file, company_name, hebrew_batch, progress=gr.Prog
 # class. Colors are written as literal hex values rather than custom CSS
 # properties, since custom :root variables can fail to resolve depending on
 # how/where Gradio injects this stylesheet.
+#
+# IMPORTANT: every *_dark variant below is pinned to match its light
+# counterpart. Gradio's default Soft theme sets dark-mode text colors to
+# white (e.g. block_title_text_color_dark="white") on the assumption dark
+# mode also swaps in a dark background. We deliberately force a light
+# background at all times (browsers/OS can request dark mode independently
+# of what we want to show), so leaving the dark-mode text defaults in place
+# made titles/labels render as invisible white-on-light-blue text for
+# anyone with a dark-mode preference. Pinning *_dark = light value gives one
+# consistent, always-legible look regardless of the visitor's OS setting.
 CLARA_THEME = gr.themes.Soft(
     primary_hue=gr.themes.colors.blue,
     secondary_hue=gr.themes.colors.indigo,
@@ -1148,35 +1158,56 @@ CLARA_THEME = gr.themes.Soft(
     font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
 ).set(
     body_background_fill="#eef3fb",
-    body_background_fill_dark="#10131c",
+    body_background_fill_dark="#eef3fb",
     background_fill_primary="#eef3fb",
+    background_fill_primary_dark="#eef3fb",
     background_fill_secondary="#f6f9fd",
+    background_fill_secondary_dark="#f6f9fd",
     block_background_fill="#fdfefe",
+    block_background_fill_dark="#fdfefe",
     block_border_color="#dce6f5",
+    block_border_color_dark="#dce6f5",
     block_border_width="1px",
     block_radius="16px",
     block_label_background_fill="#eef3fb",
+    block_label_background_fill_dark="#eef3fb",
     block_label_text_color="#39527a",
+    block_label_text_color_dark="#39527a",
     block_title_text_color="#2c3e63",
+    block_title_text_color_dark="#2c3e63",
     body_text_color="#33415c",
+    body_text_color_dark="#33415c",
+    body_text_color_subdued="#6b7fa3",
+    body_text_color_subdued_dark="#6b7fa3",
     button_primary_background_fill="linear-gradient(90deg, #6d8fd9, #8fb4e3)",
+    button_primary_background_fill_dark="linear-gradient(90deg, #6d8fd9, #8fb4e3)",
     button_primary_background_fill_hover="linear-gradient(90deg, #5c7dc7, #7ea5d9)",
+    button_primary_background_fill_hover_dark="linear-gradient(90deg, #5c7dc7, #7ea5d9)",
     button_primary_text_color="#ffffff",
+    button_primary_text_color_dark="#ffffff",
     button_secondary_background_fill="#eef3fb",
+    button_secondary_background_fill_dark="#eef3fb",
     button_secondary_background_fill_hover="#dce6f5",
+    button_secondary_background_fill_hover_dark="#dce6f5",
     button_secondary_text_color="#39527a",
+    button_secondary_text_color_dark="#39527a",
     border_color_accent="#b7cbec",
+    border_color_accent_dark="#b7cbec",
     input_background_fill="#f8faff",
+    input_background_fill_dark="#f8faff",
     input_border_color="#dce6f5",
+    input_border_color_dark="#dce6f5",
     shadow_drop="0 2px 8px rgba(60, 90, 150, 0.05)",
     shadow_drop_lg="0 6px 20px rgba(60, 90, 150, 0.08)",
 )
 
 CLARA_CSS = """
-body, .gradio-container {
+body, .gradio-container, .dark, .dark body, .dark .gradio-container {
     background-color: #eef3fb !important;
+    color: #33415c !important;
 }
-.clara-header {
+"""
+CLARA_CSS += """
     display: flex; align-items: center; gap: 16px;
     padding: 18px 24px; margin-bottom: 18px;
     background: linear-gradient(90deg, #5c7dc7 0%, #7ea5d9 55%, #a9c6e8 100%);
@@ -1256,7 +1287,7 @@ with gr.Blocks(title="Clara - LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) a
         <div class="clara-header">
             <img src="{_logo_data_uri(LOGO_PATH)}" alt="logo" />
             <div class="clara-title">
-                <h1>Clara</h1>
+                <h1>Clara — LPJ AI Agent</h1>
                 <p>By Ibrahim Zananiri</p>
             </div>
         </div>
