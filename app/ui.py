@@ -541,6 +541,7 @@ def chat_fn(message, history, hebrew_doc=False):
 
     file_context = ""
     if files:
+        yield "📄 *Extracting text from the attached file(s)…*"
         file_context = extract_context_from_files(files, hebrew=hebrew_doc)
         if len(file_context) > MAX_CONTEXT_CHARS:
             file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
@@ -553,17 +554,20 @@ def chat_fn(message, history, hebrew_doc=False):
         prompt = user_text
         if file_context:
             prompt = f"{user_text}\n\nBase the slides on this source material:\n{file_context}"
+        yield "🖌️ *Building your PowerPoint outline and slides…*"
         try:
             pptx_path = generate_presentation(prompt)
         except requests.HTTPError as e:
-            return (
+            yield (
                 "Sorry, I couldn't generate that presentation "
                 f"({e}). Try rephrasing the topic, or try again."
             )
-        return [
+            return
+        yield [
             "Here's the presentation you asked for — click below to download it:",
             gr.File(pptx_path),
         ]
+        return
 
     # Keep only plain-text turns from history — earlier attached files aren't
     # re-sent each turn (they already informed the answer they were attached to).
@@ -582,10 +586,11 @@ def chat_fn(message, history, hebrew_doc=False):
         combined_message = user_text
 
     messages = clean_history + [{"role": "user", "content": combined_message}]
+    yield "🤖 *Thinking…*"
     try:
-        return _chat_backend(messages)
+        yield _chat_backend(messages)
     except RuntimeError as e:
-        return f"⚠️ {e}"
+        yield f"⚠️ {e}"
 
 
 def legal_chat_fn(message, history, hebrew_doc=False):
@@ -609,6 +614,7 @@ def legal_chat_fn(message, history, hebrew_doc=False):
 
     file_context = ""
     if files:
+        yield "📄 *Extracting text from the attached file(s)…*", gr.skip()
         file_context = extract_context_from_files(files, hebrew=hebrew_doc)
         if len(file_context) > MAX_CONTEXT_CHARS:
             file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
@@ -632,6 +638,7 @@ def legal_chat_fn(message, history, hebrew_doc=False):
         + clean_history
         + [{"role": "user", "content": combined_message}]
     )
+    yield "⚖️ *Consulting DictaLM-3.0-24B-Thinking… this can take several minutes on CPU.*", gr.skip()
     try:
         answer = _chat_backend(
             messages, model=LEGAL_MODEL, num_predict=_LEGAL_NUM_PREDICT,
@@ -639,12 +646,13 @@ def legal_chat_fn(message, history, hebrew_doc=False):
             timeout_hint="try a narrower question -- e.g. ask about a specific section rather than a whole law.",
         )
     except RuntimeError as e:
-        return f"⚠️ {e}", gr.skip()
+        yield f"⚠️ {e}", gr.skip()
+        return
 
     citations = _extract_citations(answer)
     if not citations:
         answer += _NO_CITATION_NOTE
-    return answer, _format_citations_panel(citations)
+    yield answer, _format_citations_panel(citations)
 
 
 def legal_chat_fn_1_7b(message, history, hebrew_doc=False):
@@ -671,6 +679,7 @@ def legal_chat_fn_1_7b(message, history, hebrew_doc=False):
 
     file_context = ""
     if files:
+        yield "📄 *Extracting text from the attached file(s)…*", gr.skip()
         file_context = extract_context_from_files(files, hebrew=hebrew_doc)
         if len(file_context) > MAX_CONTEXT_CHARS:
             file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
@@ -694,6 +703,7 @@ def legal_chat_fn_1_7b(message, history, hebrew_doc=False):
         + clean_history
         + [{"role": "user", "content": combined_message}]
     )
+    yield "⚖️ *Consulting DictaLM-3.0-1.7B-Thinking…*", gr.skip()
     try:
         answer = _chat_backend(
             messages, model=LEGAL_MODEL_1_7B, num_predict=_LEGAL_NUM_PREDICT,
@@ -701,12 +711,13 @@ def legal_chat_fn_1_7b(message, history, hebrew_doc=False):
             timeout_hint="try a narrower question -- e.g. ask about a specific section rather than a whole law.",
         )
     except RuntimeError as e:
-        return f"⚠️ {e}", gr.skip()
+        yield f"⚠️ {e}", gr.skip()
+        return
 
     citations = _extract_citations(answer)
     if not citations:
         answer += _NO_CITATION_NOTE
-    return answer, _format_citations_panel(citations)
+    yield answer, _format_citations_panel(citations)
 
 
 # --- Canon AI (RAG over the Codice di Diritto Canonico, Italian) -----------
@@ -898,11 +909,25 @@ def canon_chat_fn(message, history):
     user_text = message.get("text", message) if isinstance(message, dict) else message
 
     if chromadb is None or _get_canon_collection() is None:
-        return _CANON_DB_MISSING_MSG, gr.skip()
+        yield _CANON_DB_MISSING_MSG, gr.skip()
+        return
+
+    yield "🔍 *Searching ChromaDB for canons relevant to your question…*", gr.skip()
 
     context_text, sources = retrieve_canons(user_text)
     if context_text is None:
-        return _CANON_DB_MISSING_MSG, gr.skip()
+        yield _CANON_DB_MISSING_MSG, gr.skip()
+        return
+
+    n_found = len(sources) if sources else 0
+    if n_found:
+        yield (
+            f"📖 *Found {n_found} relevant canon(s) — asking the model to "
+            f"answer using them…*",
+            gr.skip(),
+        )
+    else:
+        yield "🤔 *Nothing matched in the vector database — asking the model how to proceed…*", gr.skip()
 
     clean_history = [
         {"role": turn["role"], "content": turn["content"]}
@@ -933,9 +958,10 @@ def canon_chat_fn(message, history):
             timeout_hint="try a narrower question about a specific canon or topic.",
         )
     except RuntimeError as e:
-        return f"⚠️ {e}", gr.skip()
+        yield f"⚠️ {e}", gr.skip()
+        return
 
-    return answer, _format_canon_sources_panel(sources)
+    yield answer, _format_canon_sources_panel(sources)
 
 
 def set_hebrew_from_source_lang(source_lang):
@@ -959,7 +985,7 @@ def set_hebrew_from_source_lang(source_lang):
     return False, gr.update(value="", visible=False)
 
 
-LOGO_PATH = "app/assets/logo.png"  # put your logo file here, any size — it's auto-resized below
+LOGO_PATH = "app/assets/logo_t.png"  # transparent logo — put your logo file here, any size, it's auto-resized below
 
 SUPPORTED_INVOICE_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
@@ -1105,20 +1131,137 @@ def process_invoices(uploaded_file, company_name, hebrew_batch, progress=gr.Prog
     return out_path, summary
 
 
-with gr.Blocks(title=" Ibrahim Zananiri- AI Employee") as demo:
-    with gr.Row():
-        gr.Image(
-            value=LOGO_PATH,
-            show_label=False,
-            container=False,
-            height=60,
-            width=60,
-            scale=0,
-            show_fullscreen_button=False,
-            show_download_button=False,
-            interactive=False,
-        )
-        gr.Markdown("# Clara - LPJ AI Agent \n### By Ibrahim Zananiri")
+# --- Theme: relaxing, muted blue / white -----------------------------------
+# A softer, lower-contrast palette than a typical "app blue" -- powder-blue
+# page background, warm white cards, muted periwinkle accents instead of a
+# saturated primary blue. Selectors below are matched against Gradio's
+# actual rendered markup (verified against the installed gradio package's
+# source), not guessed -- e.g. Gradio has no ".tab-nav" class; the real tab
+# bar is ".tab-container" with buttons carrying role="tab" and a ".selected"
+# class. Colors are written as literal hex values rather than custom CSS
+# properties, since custom :root variables can fail to resolve depending on
+# how/where Gradio injects this stylesheet.
+CLARA_THEME = gr.themes.Soft(
+    primary_hue=gr.themes.colors.blue,
+    secondary_hue=gr.themes.colors.indigo,
+    neutral_hue=gr.themes.colors.slate,
+    font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
+).set(
+    body_background_fill="#eef3fb",
+    body_background_fill_dark="#10131c",
+    background_fill_primary="#eef3fb",
+    background_fill_secondary="#f6f9fd",
+    block_background_fill="#fdfefe",
+    block_border_color="#dce6f5",
+    block_border_width="1px",
+    block_radius="16px",
+    block_label_background_fill="#eef3fb",
+    block_label_text_color="#39527a",
+    block_title_text_color="#2c3e63",
+    body_text_color="#33415c",
+    button_primary_background_fill="linear-gradient(90deg, #6d8fd9, #8fb4e3)",
+    button_primary_background_fill_hover="linear-gradient(90deg, #5c7dc7, #7ea5d9)",
+    button_primary_text_color="#ffffff",
+    button_secondary_background_fill="#eef3fb",
+    button_secondary_background_fill_hover="#dce6f5",
+    button_secondary_text_color="#39527a",
+    border_color_accent="#b7cbec",
+    input_background_fill="#f8faff",
+    input_border_color="#dce6f5",
+    shadow_drop="0 2px 8px rgba(60, 90, 150, 0.05)",
+    shadow_drop_lg="0 6px 20px rgba(60, 90, 150, 0.08)",
+)
+
+CLARA_CSS = """
+body, .gradio-container {
+    background-color: #eef3fb !important;
+}
+.clara-header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 18px 24px; margin-bottom: 18px;
+    background: linear-gradient(90deg, #5c7dc7 0%, #7ea5d9 55%, #a9c6e8 100%);
+    border-radius: 18px;
+    box-shadow: 0 6px 18px rgba(92, 125, 199, 0.18);
+}
+.clara-header img {
+    height: 56px; width: 56px; object-fit: contain;
+    background: rgba(255,255,255,0.22); border-radius: 12px; padding: 6px;
+}
+.clara-header .clara-title h1 {
+    color: #ffffff !important; margin: 0; font-size: 1.6rem; font-weight: 700;
+    letter-spacing: -0.01em;
+}
+.clara-header .clara-title p {
+    color: #eaf1fb !important; margin: 2px 0 0 0; font-size: 0.95rem;
+}
+
+/* Blocks get a soft card look against the page background */
+.gradio-container .block {
+    box-shadow: 0 2px 8px rgba(60, 90, 150, 0.04);
+}
+
+/* Tabs -- matches Gradio's real markup: .tabs > .tab-wrapper > .tab-container
+   (role="tablist") > button[role="tab"], active state carries .selected */
+.tabs > .tab-wrapper > .tab-container {
+    background: #fdfefe !important;
+    border-radius: 14px !important;
+    padding: 4px 6px !important;
+    border: 1px solid #dce6f5 !important;
+    box-shadow: 0 2px 8px rgba(60, 90, 150, 0.05);
+}
+.tab-container button[role="tab"] {
+    font-weight: 600 !important;
+    color: #6b7fa3 !important;
+    border-radius: 10px !important;
+    border-bottom: none !important;
+}
+.tab-container button[role="tab"].selected {
+    color: #ffffff !important;
+    background: linear-gradient(90deg, #6d8fd9, #8fb4e3) !important;
+}
+
+/* Chat bubbles -- matches Gradio's real markup: .message.user / .message.bot */
+.message.user {
+    background: linear-gradient(90deg, #6d8fd9, #8fb4e3) !important;
+    color: #ffffff !important;
+    border-radius: 14px !important;
+}
+.message.bot {
+    background: #f6f9fd !important;
+    border: 1px solid #dce6f5 !important;
+    border-radius: 14px !important;
+}
+
+/* Headings inside markdown blocks */
+.gradio-container h1, .gradio-container h2, .gradio-container h3 {
+    color: #2c3e63;
+}
+"""
+
+def _logo_data_uri(path: str) -> str:
+    """Base64-embeds the logo directly into the page instead of relying on
+    Gradio's /file= static route (which needs the path allow-listed and can
+    vary by version/config) -- this way the header logo always renders as
+    long as the file exists on disk, with a graceful blank fallback if not."""
+    try:
+        data = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        return f"data:image/png;base64,{data}"
+    except Exception:
+        return ""
+
+
+with gr.Blocks(title="Clara - LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
+    gr.HTML(
+        f"""
+        <div class="clara-header">
+            <img src="{_logo_data_uri(LOGO_PATH)}" alt="logo" />
+            <div class="clara-title">
+                <h1>Clara</h1>
+                <p>By Ibrahim Zananiri</p>
+            </div>
+        </div>
+        """
+    )
 
     with gr.Tab("Translate"):
         with gr.Row():
