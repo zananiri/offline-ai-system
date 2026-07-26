@@ -840,29 +840,158 @@ def _embed_canon_query(text: str) -> list[float] | None:
         return None
 
 
+_CANON_NUMBER_RE = re.compile(r"\bcan(?:on)?s?\.?\s*(\d{1,4})\b", re.IGNORECASE)
+
+# How many candidates to pull from the vector index before re-ranking down
+# to _CANON_TOP_K. Over-fetching gives the re-ranker real material to work
+# with -- with n_results=5 the LLM never even sees a 6th-closest canon that
+# might actually have been the better answer; casting a wider net first and
+# then re-ranking recovers those cases.
+_CANON_FETCH_K = 15
+
+# Weight given to lexical (keyword) overlap vs. vector similarity when
+# re-ranking. Pure vector similarity can rank a topically-similar-but-wrong
+# canon above one that shares the query's actual legal terms; blending in
+# lexical overlap corrects for that without needing a cross-encoder model.
+_CANON_LEXICAL_WEIGHT = 0.35
+
+_STOPWORDS = frozenset("""
+a an the of to in on for and or is are was were be been being this that
+these those what which who whom does do did can may must shall not with
+as by from about into over under between it its it's i we you he she they
+""".split())
+
+
+def _tokenize(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z']+", text.lower()) if w not in _STOPWORDS and len(w) > 2}
+
+
+def _lexical_overlap_score(query_tokens: set[str], doc_text: str) -> float:
+    """Fraction of the query's meaningful terms that also appear in the
+    candidate canon's text -- a cheap stand-in for BM25 that needs no
+    extra dependencies or index beyond what's already in memory."""
+    if not query_tokens:
+        return 0.0
+    doc_tokens = _tokenize(doc_text)
+    return len(query_tokens & doc_tokens) / len(query_tokens)
+
+
+def _rerank_candidates(query: str, docs: list[str], metas: list[dict], distances: list[float], top_n: int):
+    """Over-fetch -> hybrid re-score (vector similarity + lexical overlap)
+    -> lightweight diversity filter, replacing plain top-K vector
+    similarity. Returns (docs, metas) trimmed to top_n, most relevant and
+    least redundant first."""
+    if not docs:
+        return [], []
+
+    query_tokens = _tokenize(query)
+    # Chroma distances are smaller-is-better (cosine distance); convert to
+    # a 0..1 similarity score so it combines cleanly with lexical overlap.
+    max_dist = max(distances) if distances else 1.0
+    scored = []
+    for doc, meta, dist in zip(docs, metas, distances):
+        vector_sim = 1.0 - (dist / max_dist if max_dist > 0 else 0.0)
+        lexical = _lexical_overlap_score(query_tokens, doc)
+        hybrid = (1 - _CANON_LEXICAL_WEIGHT) * vector_sim + _CANON_LEXICAL_WEIGHT * lexical
+        scored.append((hybrid, doc, meta))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Diversity filter: greedily keep the next-best candidate only if it
+    # doesn't overlap too heavily (by shared tokens) with something already
+    # selected, so near-duplicate/adjacent canons don't crowd out the top_n
+    # slots at the expense of covering the question from other angles.
+    selected_docs, selected_metas, selected_tokens = [], [], []
+    for hybrid, doc, meta in scored:
+        if len(selected_docs) >= top_n:
+            break
+        doc_tokens = _tokenize(doc)
+        too_similar = any(
+            len(doc_tokens & prev) / max(1, min(len(doc_tokens), len(prev))) > 0.75
+            for prev in selected_tokens
+        )
+        if too_similar and len(selected_docs) > 0:
+            continue
+        selected_docs.append(doc)
+        selected_metas.append(meta)
+        selected_tokens.append(doc_tokens)
+
+    return selected_docs, selected_metas
+
+
 def retrieve_canons(query: str, n_results: int = _CANON_TOP_K):
     """
-    Embeds the query with nomic-embed-text and retrieves the closest
-    canons from ChromaDB. Returns (context_text, sources) where sources
-    is a list of dicts used to build the sidebar panel -- or (None, None)
-    on any failure (missing DB, unreachable Ollama, etc.), which callers
-    turn into a clear in-chat message rather than a silent empty answer.
+    Retrieves relevant canons for a query, combining three strategies:
+
+    1. Exact match: if the query names a specific canon number (e.g. "canon
+       1055" or "can. 129"), that canon is fetched directly via a metadata
+       filter and placed first. Vector similarity alone is unreliable for
+       exact lookups -- a query embedding for "canon 1055" isn't guaranteed
+       to land closest to canon 1055's own embedding, especially for canons
+       with short or generic text.
+    2. Semantic search + hybrid re-rank: the query is embedded with
+       nomic-embed-text, _CANON_FETCH_K candidates are pulled by vector
+       similarity, then re-scored by blending vector similarity with
+       lexical keyword overlap and filtered for diversity, before trimming
+       down to n_results. This catches cases where the plain nearest
+       neighbour isn't actually the best answer, without needing a
+       cross-encoder model.
+    3. Diversity filtering (part of the re-rank step above) avoids near-
+       duplicate/adjacent canons crowding out the final n_results slots.
+
+    Returns (context_text, sources) where sources is a list of dicts used
+    to build the sidebar panel -- or (None, None) on any failure (missing
+    DB, unreachable Ollama, etc.), which callers turn into a clear in-chat
+    message rather than a silent empty answer.
     """
     collection = _get_canon_collection()
     if collection is None:
         return None, None
 
+    exact_docs, exact_metas = [], []
+    for canon_num in dict.fromkeys(_CANON_NUMBER_RE.findall(query)):  # dedupe, keep order
+        for candidate in (canon_num, int(canon_num)):  # metadata may be str or int
+            try:
+                hit = collection.get(where={"canon_number": candidate})
+            except Exception:
+                continue
+            for doc, meta in zip(hit.get("documents") or [], hit.get("metadatas") or []):
+                exact_docs.append(doc)
+                exact_metas.append(meta)
+            if hit.get("documents"):
+                break  # found it under this type, no need to try the other
+
     query_vector = _embed_canon_query(query)
-    if query_vector is None:
+    if query_vector is None and not exact_docs:
         return None, None
 
-    try:
-        results = collection.query(query_embeddings=[query_vector], n_results=n_results)
-    except Exception:
-        return None, None
+    vector_docs, vector_metas = [], []
+    if query_vector is not None:
+        try:
+            results = collection.query(
+                query_embeddings=[query_vector],
+                n_results=_CANON_FETCH_K,
+                include=["documents", "metadatas", "distances"],
+            )
+            raw_docs = (results.get("documents") or [[]])[0]
+            raw_metas = (results.get("metadatas") or [[]])[0]
+            raw_dists = (results.get("distances") or [[]])[0]
+            vector_docs, vector_metas = _rerank_candidates(
+                query, raw_docs, raw_metas, raw_dists, top_n=n_results
+            )
+        except Exception:
+            pass  # exact matches (if any) still make it through below
 
-    documents = (results.get("documents") or [[]])[0]
-    metadatas = (results.get("metadatas") or [[]])[0]
+    # Merge exact matches first, then vector results, de-duping by canon
+    # number so a canon named explicitly doesn't also show up twice.
+    seen = set()
+    documents, metadatas = [], []
+    for doc, meta in zip(exact_docs + vector_docs, exact_metas + vector_metas):
+        key = meta.get("canon_number", "?")
+        if key in seen:
+            continue
+        seen.add(key)
+        documents.append(doc)
+        metadatas.append(meta)
 
     if not documents:
         return "", []
@@ -1208,6 +1337,7 @@ body, .gradio-container, .dark, .dark body, .dark .gradio-container {
 }
 """
 CLARA_CSS += """
+.clara-header {
     display: flex; align-items: center; gap: 16px;
     padding: 18px 24px; margin-bottom: 18px;
     background: linear-gradient(90deg, #5c7dc7 0%, #7ea5d9 55%, #a9c6e8 100%);
@@ -1215,8 +1345,21 @@ CLARA_CSS += """
     box-shadow: 0 6px 18px rgba(92, 125, 199, 0.18);
 }
 .clara-header img {
-    height: 56px; width: 56px; object-fit: contain;
+    /* Sized as an explicit 4x ratio to the title text next to it
+       (h1 font-size is 1.6rem, so 4 * 1.6rem = 6.4rem here) rather than a
+       fixed pixel guess, so the relationship holds if the title size ever
+       changes. `!important` + `max-width: none` are required because
+       Gradio's base stylesheet includes a generic
+       `img { max-width: 100%; height: auto }` reset that otherwise wins
+       and was letting this render at the image's native size instead of
+       the intended header-icon size. */
+    height: 6.4rem !important;
+    width: 6.4rem !important;
+    max-width: none !important;
+    max-height: none !important;
+    object-fit: contain;
     background: rgba(255,255,255,0.22); border-radius: 12px; padding: 6px;
+    flex-shrink: 0;
 }
 .clara-header .clara-title h1 {
     color: #ffffff !important; margin: 0; font-size: 1.6rem; font-weight: 700;
