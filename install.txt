@@ -16,7 +16,10 @@ pip install -r requirements.lock.txt
 powershellollama serve
 New tab:
 powershell.\.venv\Scripts\Activate.ps1
+ollama pull gpt-oss:20b
 ollama pull qwen2.5:7b-instruct-q4_K_M
+(qwen2.5 backs ONLY the Translate tab's optional summarizer step -- see
+TRANSLATE_SUMMARY_MODEL in app/main.py and app/ui.py.)
 ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
 (Legal tab model, ~14.3GB download -- must match LEGAL_MODEL in app/main.py
 and app/ui.py. Skip/replace with the smaller 1.7B or IQ4_XS quant if this

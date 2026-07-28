@@ -109,6 +109,13 @@ else
     ok "Ollama already running."
 fi
 
+info "Pulling gpt-oss:20b (~13GB)..."
+ollama pull gpt-oss:20b
+
+# Backs ONLY the Translate tab's optional summarizer step (app/main.py's
+# TRANSLATE_SUMMARY_MODEL / app/ui.py's TRANSLATE_SUMMARY_MODEL) -- kept as
+# a separate, smaller pull since qwen2.5's multilingual output is more
+# reliable than gpt-oss:20b's for non-English summaries.
 info "Pulling qwen2.5:7b-instruct-q4_K_M (~4.7GB)..."
 ollama pull qwen2.5:7b-instruct-q4_K_M
 

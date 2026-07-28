@@ -1,13 +1,13 @@
 """
 Generates PowerPoint (.pptx) files on demand from a plain-language prompt.
 
-Uses the same local Ollama model (qwen2.5) already used elsewhere in this
-app for non-translation tasks, plus python-pptx (MIT licensed, fully
+Uses the same local Ollama model (gpt-oss:20b) already used elsewhere in
+this app for non-translation tasks, plus python-pptx (MIT licensed, fully
 offline -- no network calls, no paid API) to actually build the file.
 
 Flow:
     prompt (topic, optionally with attached-document context / slide count)
-        -> qwen2.5 asked for a strict JSON outline (title + per-slide
+        -> gpt-oss:20b asked for a strict JSON outline (title + per-slide
            heading/bullets)
         -> python-pptx turns that outline into a real .pptx file on disk
 """
@@ -24,7 +24,7 @@ from pptx.enum.text import PP_ALIGN
 # Kept in sync with main.py's default chat model -- this is the model used
 # everywhere else in the app for non-translation work (summarizing,
 # classifying invoices, etc.), so presentation generation reuses it too.
-OLLAMA_MODEL = "qwen2.5:7b-instruct-q4_K_M"
+OLLAMA_MODEL = "gpt-oss:20b"
 
 _OUTLINE_SYSTEM_PROMPT = (
     "You create outlines for PowerPoint presentations. Given a topic (and, "

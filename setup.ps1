@@ -103,6 +103,13 @@ Write-Host "Starting Ollama service..." -ForegroundColor Yellow
 Start-Process -NoNewWindow ollama serve
 Start-Sleep -Seconds 5
 
+Write-Host "Pulling gpt-oss:20b (~13GB)..." -ForegroundColor Yellow
+ollama pull gpt-oss:20b
+
+# Backs ONLY the Translate tab's optional summarizer step (app/main.py's
+# TRANSLATE_SUMMARY_MODEL / app/ui.py's TRANSLATE_SUMMARY_MODEL) -- kept as
+# a separate, smaller pull since qwen2.5's multilingual output is more
+# reliable than gpt-oss:20b's for non-English summaries.
 Write-Host "Pulling qwen2.5:7b-instruct-q4_K_M (~4.7GB)..." -ForegroundColor Yellow
 ollama pull qwen2.5:7b-instruct-q4_K_M
 

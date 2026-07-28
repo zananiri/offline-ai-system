@@ -29,7 +29,23 @@ from app.pptx_generator import generate_pptx
 
 app = FastAPI(title="Offline Translator + Document OCR")
 
-OLLAMA_MODEL = "qwen2.5:7b-instruct-q4_K_M"
+OLLAMA_MODEL = "gpt-oss:20b"
+
+# Backs ONLY the Translate tab's optional "Also summarize with AI" step
+# (see /translate-document below) -- deliberately kept separate from the
+# general OLLAMA_MODEL default above, which now points at gpt-oss:20b for
+# Chat/Canon AI/invoice classification/pptx outlines. qwen2.5-instruct is
+# explicitly trained and marketed for strong multilingual generation across
+# this app's translation targets (French/Spanish/Italian/German/Arabic/
+# Chinese/Russian/Hebrew); gpt-oss:20b is primarily English-optimized and
+# is more prone to drifting back into English on a non-English summary
+# despite the "Respond ONLY in {target_lang}" system-prompt instruction --
+# exactly the kind of target-language failure translate.py's own
+# _wrong_language() check exists to catch on the MADLAD-400 side, but which
+# the Ollama-based summary step below has no equivalent safety net for.
+# Pulled the same way as OLLAMA_MODEL -- see setup.ps1/setup_mac.sh/
+# install.txt (`ollama pull qwen2.5:7b-instruct-q4_K_M`).
+TRANSLATE_SUMMARY_MODEL = "qwen2.5:7b-instruct-q4_K_M"
 
 # Backs the Legal tab. Must be pulled once via:
 #   ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
@@ -109,7 +125,9 @@ def _num_ctx_for(num_predict: int, requested: int | None) -> int:
 # DictaLM-3.0-24B-Thinking (like other "thinking" models, e.g. QwQ/R1-style)
 # emits its chain-of-thought wrapped in <think>...</think> before the real
 # answer. Strip it so the chat UI only ever shows the final response — this
-# is a no-op for models (like the default qwen2.5) that never emit the tag.
+# is a no-op for models (like the default gpt-oss:20b) that never emit the tag
+# in-content (gpt-oss's reasoning comes back via Ollama's separate "thinking"
+# field, not an inline <think> tag, but this stays a safe no-op either way).
 # If DictaLM turns out to use a different wrapper tag, update this regex.
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
@@ -285,7 +303,7 @@ async def generate_pptx_endpoint(payload: dict):
     include attached-document text to summarize into slides (the Chat tab's
     UI builds that combined prompt before calling this).
 
-    Uses qwen2.5 (via Ollama) to draft a JSON slide outline, then
+    Uses gpt-oss:20b (via Ollama) to draft a JSON slide outline, then
     python-pptx (MIT licensed) to build the actual file -- both steps run
     fully locally, no external/paid presentation-generation service involved.
     """
@@ -376,10 +394,12 @@ async def translate_document(
     translated_text = "\n\n".join(translated_chunks)
 
     # 4. Optional: Ollama pass to clean up structure / summarize
+    # Uses TRANSLATE_SUMMARY_MODEL (qwen2.5), not the general OLLAMA_MODEL
+    # (gpt-oss) -- see that constant's comment above for why.
     summary = None
     if summarize:
         response = _ollama_client.chat(
-            model=OLLAMA_MODEL,
+            model=TRANSLATE_SUMMARY_MODEL,
             messages=[
                 {
                     "role": "system",

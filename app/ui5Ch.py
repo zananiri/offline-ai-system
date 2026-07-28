@@ -25,19 +25,6 @@ from app.document import chunk_text
 
 BACKEND_URL = "http://localhost:8000"
 
-# Backs ONLY the Translate tab's optional "Also summarize with AI" step
-# (see process() below). NOTE: this string is duplicated in app/main.py's
-# TRANSLATE_SUMMARY_MODEL (same reasoning as LEGAL_MODEL's duplication --
-# ui.py only talks to the backend over HTTP and can't share a Python
-# constant with it) -- keep the two in sync if you change the model.
-# Deliberately kept separate from the backend's general OLLAMA_MODEL
-# default (gpt-oss:20b, used by Chat/Canon AI/invoice classification):
-# qwen2.5-instruct is explicitly trained for strong multilingual output
-# across this app's translation targets, where gpt-oss:20b is more prone
-# to drifting back into English despite the "Respond ONLY in {target_lang}"
-# instruction below -- see main.py's TRANSLATE_SUMMARY_MODEL comment.
-TRANSLATE_SUMMARY_MODEL = "qwen2.5:7b-instruct-q4_K_M"
-
 # Matches (and pads slightly past) main.py's own _OLLAMA_REQUEST_TIMEOUT_SECONDS,
 # so this client never gives up before the backend's own safety-net timeout
 # would already have returned a clean error. Without this, requests has no
@@ -123,6 +110,14 @@ def _chat_backend(messages, model=None, num_predict=None, num_ctx=None, timeout=
 # Previous (faster, weaker) setting, kept here for an easy revert:
 #   LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 LEGAL_MODEL = "hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M"
+
+# Backs the separate "Attorney 1.7B" tab (see legal_chat_fn_1_7b below) --
+# Dicta's smallest model in this family, kept alongside the 24B as a fast
+# option rather than a replacement for it. NOT pulled by setup.ps1/
+# install.txt -- pull it manually once, same venv active:
+#   ollama pull hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M
+# (~1.1GB download; confirm it landed with `ollama list`)
+LEGAL_MODEL_1_7B = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 
 # See main.py's _DEFAULT_NUM_PREDICT comment for the full story: with no cap
 # at all, a "thinking" model on a broad question can run for as long as it
@@ -452,7 +447,7 @@ def process(file, source_lang, target_lang, summarize, hebrew_doc, progress=gr.P
             {"role": "user", "content": f"Summarize this in 3-5 bullet points:\n\n{translated_text}"},
         ]
         try:
-            summary = _chat_backend(messages, model=TRANSLATE_SUMMARY_MODEL)
+            summary = _chat_backend(messages)
         except RuntimeError as e:
             summary = f"⚠️ Summary failed: {e}"
 
@@ -644,10 +639,75 @@ def legal_chat_fn(message, history, hebrew_doc=False):
         + clean_history
         + [{"role": "user", "content": combined_message}]
     )
-    yield "⚖️ *Consulting AI… this can take several minutes on CPU.*", gr.skip()
+    yield "⚖️ *Consulting DictaLM-3.0-24B-Thinking… this can take several minutes on CPU.*", gr.skip()
     try:
         answer = _chat_backend(
             messages, model=LEGAL_MODEL, num_predict=_LEGAL_NUM_PREDICT,
+            num_ctx=_LEGAL_NUM_CTX, timeout=_LEGAL_REQUEST_TIMEOUT_SECONDS,
+            timeout_hint="try a narrower question -- e.g. ask about a specific section rather than a whole law.",
+        )
+    except RuntimeError as e:
+        yield f"⚠️ {e}", gr.skip()
+        return
+
+    citations = _extract_citations(answer)
+    if not citations:
+        answer += _NO_CITATION_NOTE
+    yield answer, _format_citations_panel(citations)
+
+
+def legal_chat_fn_1_7b(message, history, hebrew_doc=False):
+    """
+    Identical to legal_chat_fn, routed to LEGAL_MODEL_1_7B (DictaLM-3.0-1.7B-
+    Thinking) instead of the 24B flagship. Kept as a fully separate function
+    (rather than a model parameter on legal_chat_fn) so the "Attorney 24B"
+    and "Attorney 1.7B" tabs stay independently editable, same reasoning as
+    legal_chat_fn's own docstring for why it isn't folded into chat_fn.
+
+    Reuses _LEGAL_NUM_PREDICT/_LEGAL_NUM_CTX/_LEGAL_REQUEST_TIMEOUT_SECONDS
+    as-is -- these were sized for the slower 24B model, so they're safe
+    (generous) upper bounds here too; the 1.7B will simply finish well
+    inside them.
+
+    Returns (answer, citations_panel_markdown) -- see legal_chat_fn.
+    """
+    if isinstance(message, dict):
+        user_text = message.get("text", "")
+        files = message.get("files", []) or []
+    else:
+        user_text = message
+        files = []
+
+    file_context = ""
+    if files:
+        yield "📄 *Extracting text from the attached file(s)…*", gr.skip()
+        file_context = extract_context_from_files(files, hebrew=hebrew_doc)
+        if len(file_context) > MAX_CONTEXT_CHARS:
+            file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
+
+    clean_history = [
+        {"role": turn["role"], "content": turn["content"]}
+        for turn in history
+        if isinstance(turn.get("content"), str)
+    ]
+
+    if file_context:
+        combined_message = (
+            f"The user attached the following document(s):\n\n{file_context}\n\n"
+            f"User question: {user_text}"
+        )
+    else:
+        combined_message = user_text
+
+    messages = (
+        [{"role": "system", "content": LEGAL_SYSTEM_PROMPT}]
+        + clean_history
+        + [{"role": "user", "content": combined_message}]
+    )
+    yield "⚖️ *Consulting DictaLM-3.0-1.7B-Thinking…*", gr.skip()
+    try:
+        answer = _chat_backend(
+            messages, model=LEGAL_MODEL_1_7B, num_predict=_LEGAL_NUM_PREDICT,
             num_ctx=_LEGAL_NUM_CTX, timeout=_LEGAL_REQUEST_TIMEOUT_SECONDS,
             timeout_hint="try a narrower question -- e.g. ask about a specific section rather than a whole law.",
         )
@@ -684,24 +744,14 @@ _CANON_QUERY_PREFIX = "search_query: "
 
 # How many canons to retrieve per question. Higher = more coverage but
 # more context spent on possibly-irrelevant canons.
-# Raised 5 -> 8: with only 5 slots, a relevant-but-not-top-1 canon pulled
-# in by _CANON_FETCH_K's wider net was still frequently getting trimmed
-# off again by the re-rank step below before it ever reached the LLM.
-# Re-validate with test_canon_rag.py (Recall@1/@3/@5, MRR) if you tune
-# this further -- there's a real prompt-size/latency cost to going higher,
-# especially now that generation runs on the larger gpt-oss:20b model.
-_CANON_TOP_K = 8
+_CANON_TOP_K = 5
 
-# Model that answers using the retrieved canons. Pinned explicitly to
-# gpt-oss:20b (same model the plain Chat tab uses) rather than left as None
-# to inherit the backend's OLLAMA_MODEL default -- Canon AI and Chat are
-# deliberately meant to share this model, but making it explicit here means
-# that stays true even if OLLAMA_MODEL is ever repurposed/changed in
-# main.py for something else (e.g. invoice classification) without this
-# tab silently following along. Set to a different Ollama model string
-# (pulled and available to the backend) if you want Canon AI on its own
-# dedicated model instead, e.g. one of the LEGAL_MODEL constants above.
-CANON_MODEL = "gpt-oss:20b"
+# Model that answers using the retrieved canons. Left as None to use
+# whatever the backend's own default chat model is (same as the plain
+# Chat tab) -- set this to a specific Ollama model string (pulled and
+# available to the backend) if you want Canon AI on its own dedicated
+# model instead, e.g. one of the LEGAL_MODEL constants above.
+CANON_MODEL = None
 _CANON_NUM_PREDICT = 2048
 _CANON_REQUEST_TIMEOUT_SECONDS = 900
 
@@ -807,11 +857,7 @@ _CANON_NUMBER_RE = re.compile(
 # with -- with n_results=5 the LLM never even sees a 6th-closest canon that
 # might actually have been the better answer; casting a wider net first and
 # then re-ranking recovers those cases.
-# Raised 15 -> 25 alongside the _CANON_TOP_K increase above: the true best
-# match for a semantic (non-numeric) query isn't always in Chroma's raw
-# top 15 by pure vector distance -- widening the pool before hybrid
-# re-ranking reduces the chance it gets excluded before it's even scored.
-_CANON_FETCH_K = 25
+_CANON_FETCH_K = 15
 
 # Weight given to lexical (keyword) overlap vs. vector similarity when
 # re-ranking. Pure vector similarity can rank a topically-similar-but-wrong
@@ -885,16 +931,8 @@ def _rerank_candidates(query: str, docs: list[str], metas: list[dict], distances
         if len(selected_docs) >= top_n:
             break
         doc_tokens = _tokenize(doc)
-        # Raised 0.75 -> 0.85: two canons on the same topic can legitimately
-        # share a lot of vocabulary (e.g. adjacent canons in the same
-        # article) while still being distinct, correct answers -- 0.75 was
-        # sometimes excluding a genuinely relevant canon just for being
-        # lexically close to one already selected. Re-check with
-        # test_canon_rag.py if you tune this further; too high and
-        # near-duplicate/redundant canons start crowding out real coverage
-        # again.
         too_similar = any(
-            len(doc_tokens & prev) / max(1, min(len(doc_tokens), len(prev))) > 0.85
+            len(doc_tokens & prev) / max(1, min(len(doc_tokens), len(prev))) > 0.75
             for prev in selected_tokens
         )
         if too_similar and len(selected_docs) > 0:
@@ -1478,7 +1516,7 @@ with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                     "(with OCR if needed) and exported as a .docx file.")
         convert_file_in = gr.File(label="Upload PDF or image")
         hebrew_doc_convert = gr.Checkbox(
-            label="Document is in Hebrew (uses Hebrew OCR instead of the default engine)"
+            label="Document is in Hebrew (uses Tesseract OCR instead of the default engine)"
         )
         convert_btn = gr.Button("Convert to Word")
         convert_output = gr.File(label="Download .docx")
@@ -1497,7 +1535,7 @@ with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                     "deck) about ...\"** and it will build a downloadable .pptx file — attach "
                     "a document first if you want the slides based on that document.")
         chat_hebrew_checkbox = gr.Checkbox(
-            label="Attached document is in Hebrew (uses Hebrew OCR instead of the default engine)"
+            label="Attached document is in Hebrew (uses Tesseract OCR instead of the default engine)"
         )
         gr.ChatInterface(
             fn=chat_fn, type="messages", multimodal=True,
@@ -1524,7 +1562,7 @@ with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
         )
         zip_in = gr.File(label="Upload ZIP or PDF of invoice/receipt scans", file_types=[".zip", ".pdf"])
         hebrew_batch_in = gr.Checkbox(
-            label="These documents are in Hebrew (uses Hebrew OCR instead of the default engine)"
+            label="These documents are in Hebrew (uses Tesseract OCR instead of the default engine)"
         )
         process_btn = gr.Button("Process Invoices", variant="primary")
         report_out = gr.File(label="Download Excel Report")
@@ -1539,7 +1577,7 @@ with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
     with gr.Tab("Attorney 24B"):
         gr.Markdown(
             "Chat with the local Hebrew-legal model "
-            "**Cutoff Date August 2025**. Attach a PDF, DOCX, "
+            "(**DictaLM-3.0-24B-Thinking**, served via Ollama). Attach a PDF, DOCX, "
             "PPTX, or image and ask questions about it — text (with OCR if needed) "
             "is extracted and given to the model as context.\n\n"
             "⚠️ This is not a substitute for advice from a licensed attorney. "
@@ -1548,7 +1586,7 @@ with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
             "that doesn't actually exist."
         )
         legal_hebrew_checkbox = gr.Checkbox(
-            label="Attached document is in Hebrew (uses Hebrew OCR instead of the default engine)"
+            label="Attached document is in Hebrew (uses Tesseract OCR instead of the default engine)"
         )
         # Defined here (render=False) so it can be passed to ChatInterface's
         # additional_outputs below, then actually placed in the right-hand
@@ -1566,6 +1604,33 @@ with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
             with gr.Column(scale=1):
                 gr.Markdown("### 📚 Citations found")
                 legal_citations_panel.render()
+
+    with gr.Tab("Attorney 1.7B"):
+        gr.Markdown(
+            "Chat with the local Hebrew-legal model "
+            "(**DictaLM-3.0-1.7B-Thinking**, served via Ollama). Attach a PDF, DOCX, "
+            "PPTX, or image and ask questions about it — text (with OCR if needed) "
+            "is extracted and given to the model as context.\n\n"
+            "⚠️ This is not a substitute for advice from a licensed attorney. "
+            "Citations to specific laws, sections, or cases should be independently "
+            "verified — small local models can occasionally cite a law or section "
+            "that doesn't actually exist. This is the smaller/faster 1.7B model, so "
+            "it's weaker on legal reasoning and citation accuracy than Attorney 24B."
+        )
+        legal_hebrew_checkbox_1_7b = gr.Checkbox(
+            label="Attached document is in Hebrew (uses Tesseract OCR instead of the default engine)"
+        )
+        legal_citations_panel_1_7b = gr.Markdown(_CITATIONS_PLACEHOLDER, render=False)
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.ChatInterface(
+                    fn=legal_chat_fn_1_7b, type="messages", multimodal=True,
+                    additional_inputs=[legal_hebrew_checkbox_1_7b],
+                    additional_outputs=[legal_citations_panel_1_7b],
+                )
+            with gr.Column(scale=1):
+                gr.Markdown("### 📚 Citations found")
+                legal_citations_panel_1_7b.render()
 
     with gr.Tab("Canon AI"):
         gr.Markdown(
