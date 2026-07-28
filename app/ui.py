@@ -3,6 +3,7 @@ Gradio UI — talks to the FastAPI backend at localhost:8000.
 Run after main.py is already running: python -m app.ui
 """
 import base64
+import unicodedata
 import re
 import tempfile
 import zipfile
@@ -840,7 +841,16 @@ def _embed_canon_query(text: str) -> list[float] | None:
         return None
 
 
-_CANON_NUMBER_RE = re.compile(r"\bcan(?:on)?s?\.?\s*(\d{1,4})\b", re.IGNORECASE)
+# Matches how a canon number is named across English, Latin-abbreviated,
+# and Italian phrasing: "can. 1055" / "canon 1055" / "canone 1055" /
+# "canoni 1055" / "cann. 1055" / "can. n. 1055". Italian users naturally
+# write "canone"/"canoni" (not the Latin/English "can./canon" the previous
+# version of this regex only covered), which silently meant the
+# exact-match lookup below never fired for them at all.
+_CANON_NUMBER_RE = re.compile(
+    r"\bcann?(?:on(?:e|i)?|s)?\.?\s*(?:n(?:um)?\.?\s*)?(\d{1,4})\b",
+    re.IGNORECASE,
+)
 
 # How many candidates to pull from the vector index before re-ranking down
 # to _CANON_TOP_K. Over-fetching gives the re-ranker real material to work
@@ -859,11 +869,27 @@ _STOPWORDS = frozenset("""
 a an the of to in on for and or is are was were be been being this that
 these those what which who whom does do did can may must shall not with
 as by from about into over under between it its it's i we you he she they
+""".split() + """
+il lo la i gli le un uno una del dello della dei degli delle al allo alla
+ai agli alle dal dallo dalla dai dagli dalle nel nello nella nei negli
+nelle sul sullo sulla sui sugli sulle col coi che chi cosa come dove
+quando perche perché non ma se anche piu più meno molto questo questa
+questi queste quello quella quelli quelle ed cioe cioè dice dicono essere
+sono stato stata essendo fra tra con per su da di
 """.split())
 
 
+def _strip_accents(text: str) -> str:
+    """NFKD-decomposes accented characters and drops the combining marks
+    (e.g. 'nullità' -> 'nullita'), so Italian words match consistently
+    without the previous behaviour of the plain [a-z'] regex silently
+    truncating a word at its first accented character (e.g. 'nullit')."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+
+
 def _tokenize(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z']+", text.lower()) if w not in _STOPWORDS and len(w) > 2}
+    ascii_text = _strip_accents(text.lower())
+    return {w for w in re.findall(r"[a-z']+", ascii_text) if w not in _STOPWORDS and len(w) > 2}
 
 
 def _lexical_overlap_score(query_tokens: set[str], doc_text: str) -> float:
@@ -1424,14 +1450,14 @@ def _logo_data_uri(path: str) -> str:
         return ""
 
 
-with gr.Blocks(title="Clara - LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
+with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
     gr.HTML(
         f"""
         <div class="clara-header">
             <img src="{_logo_data_uri(LOGO_PATH)}" alt="logo" />
             <div class="clara-title">
-                <h1>Clara — LPJ AI Agent</h1>
-                <p>By Ibrahim Zananiri</p>
+                <h1> LPJ AI Agent</h1>
+                <p></p>
             </div>
         </div>
         """

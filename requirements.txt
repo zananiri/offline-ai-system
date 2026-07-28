@@ -41,6 +41,16 @@ python-pptx>=1.0,<2.0     # MIT licensed, fully offline -- builds the .pptx file
 pypandoc==1.13             # wraps the pandoc binary installed by setup.ps1
 pydantic>=2.9,<3.0
 
+# Tier 5: Canon AI tab only (local RAG vector store over CIC IT content)
+# Kept unpinned like Tier 2 -- only used by scripts/scrape_cic_it.py and
+# scripts/embed_to_chroma.py (one-time/offline, not imported by the running
+# app), and the error message the Canon AI tab shows when this is missing
+# just says `pip install chromadb` with no version. NOTE: chromadb has had
+# breaking API changes across major versions (0.x -> 1.x) -- if
+# embed_to_chroma.py starts failing after a `pip install --upgrade`, pin
+# this to whatever version was last known to work with that script.
+chromadb
+
 # NOTE: setup.ps1 runs `pip freeze > requirements.lock.txt` after a clean
 # install. That lock file — not this one — is your real reproducibility
 # record, since fastapi/uvicorn/gradio move fast and this file only sets floors.

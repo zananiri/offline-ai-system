@@ -106,14 +106,12 @@ Start-Sleep -Seconds 5
 Write-Host "Pulling qwen2.5:7b-instruct-q4_K_M (~4.7GB)..." -ForegroundColor Yellow
 ollama pull qwen2.5:7b-instruct-q4_K_M
 
-# This pulls the 24B flagship because that's what LEGAL_MODEL is actually
-# set to in app/main.py and app/ui.py -- better legal reasoning/citations,
-# real tradeoff is size (~14.3GB) and much slower CPU generation. If you'd
-# rather use the smaller 1.7B model for speed on CPU/iGPU-bound machines
-# (~1.1GB, weaker legal reasoning/citation accuracy), swap the line below
-# AND update the matching LEGAL_MODEL constant in both app/main.py and
-# app/ui.py to keep the pulled model and the code in sync:
-#   ollama pull hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M
+# Matches the LEGAL_MODEL constant in app/main.py and app/ui.py -- keep all
+# three in sync if that ever changes. Dicta's 24B flagship, Q4_K_M quant,
+# ~14.3GB download. Needs ~32GB RAM alongside this app's other models (see
+# ui.py's LEGAL_MODEL comment); if that's tight, switch this line (and both
+# LEGAL_MODEL constants) to the IQ4_XS quant (~12.8GB) or the smaller 1.7B
+# line kept there for an easy revert.
 Write-Host "Pulling hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M (Legal tab model, ~14.3GB)..." -ForegroundColor Yellow
 ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
 
@@ -123,6 +121,19 @@ ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
 Write-Host "Converting MADLAD-400-3B to CTranslate2 format..." -ForegroundColor Yellow
 Write-Host "(this downloads several GB from Hugging Face once, then quantizes to int8)" -ForegroundColor DarkYellow
 python scripts\convert_translation_model.py
+
+# ---------------------------------------------------------------------------
+# 6. Build the Canon AI vector store (needs internet once, for chromadb + scraping)
+# ---------------------------------------------------------------------------
+Write-Host "Installing chromadb (not in requirements.txt's Ollama/torch pins -- kept" -ForegroundColor Yellow
+Write-Host "separate since it's only used by the Canon AI tab)..." -ForegroundColor Yellow
+pip install chromadb
+
+Write-Host "Scraping CIC IT source content..." -ForegroundColor Yellow
+python scripts\scrape_cic_it.py
+
+Write-Host "Embedding into ChromaDB (app\chroma_db, collection 'cic_it')..." -ForegroundColor Yellow
+python scripts\embed_to_chroma.py
 
 Write-Host ""
 Write-Host "=== Setup complete ===" -ForegroundColor Cyan
