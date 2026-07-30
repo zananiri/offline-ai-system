@@ -520,6 +520,72 @@ def _is_pptx_request(text: str) -> bool:
     return bool(_PPTX_NOUN_RE.search(text)) and bool(_PPTX_VERB_RE.search(text))
 
 
+# Matches a request to rewrite/polish/formalize text, e.g. "rewrite this
+# more professionally", "polish the language", "make this sound formal".
+# When this fires on a message with an attached file, chat_fn routes to
+# rewrite_document_professionally() instead of the normal single-shot chat
+# call -- see that function's docstring for why a single call can't do this
+# faithfully for a long document.
+_REWRITE_TRIGGER_RE = re.compile(
+    r"\b(re-?write|polish|proofread|professionali[sz]e|tidy up|clean up|"
+    r"formali[sz]e)\b|\bmore professional\b|\bmake.{0,25}professional\b",
+    re.IGNORECASE,
+)
+
+
+def _is_rewrite_request(text: str) -> bool:
+    return bool(_REWRITE_TRIGGER_RE.search(text or ""))
+
+
+# Paragraph-sized, not sentence-sized like translate.py's chunk_text(max_chars=400)
+# -- a rewrite call needs enough surrounding context per chunk to produce
+# coherent, professional prose, but still small enough that num_predict
+# below comfortably covers the rewritten output without the model needing
+# to compress/summarize to fit.
+_REWRITE_CHUNK_CHARS = 3000
+
+# Rewritten prose is rarely much longer than the original for a given
+# chunk size, so this headroom (well above _REWRITE_CHUNK_CHARS in tokens)
+# is enough to let each chunk come back in full rather than getting cut off
+# or compressed. Kept well under _DEFAULT_NUM_CTX (8192) so the backend's
+# default num_ctx doesn't need overriding per call.
+_REWRITE_NUM_PREDICT_PER_CHUNK = 1600
+
+_REWRITE_SYSTEM_PROMPT = (
+    "You are a professional editor. Rewrite the user's text in clear, "
+    "professional English. Preserve every fact, figure, name, date, and "
+    "detail exactly as given -- do NOT summarize, shorten, condense into a "
+    "table or bullet points, or omit anything. Keep the same structure, "
+    "order, and level of detail as the original; only improve grammar, "
+    "tone, and word choice. Output ONLY the rewritten text, with no "
+    "preamble, headers, or commentary of your own."
+)
+
+
+def rewrite_document_professionally(file_context: str) -> str:
+    """
+    Rewrites a (potentially long) attached document into professional
+    English while preserving all information, by processing it in
+    paragraph-sized chunks and reassembling the results -- mirroring the
+    per-chunk approach translate.py already uses for the same reason: a
+    single call on a whole multi-page document runs into the model's
+    num_predict/num_ctx ceiling and starts compressing/summarizing instead
+    of reproducing everything, which is exactly the "13 pages -> 1-2 page
+    table" failure this was written to fix.
+    """
+    chunks = chunk_text(file_context, max_chars=_REWRITE_CHUNK_CHARS)
+    rewritten_parts = []
+    for chunk in chunks:
+        messages = [
+            {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
+            {"role": "user", "content": chunk},
+        ]
+        rewritten_parts.append(
+            _chat_backend(messages, num_predict=_REWRITE_NUM_PREDICT_PER_CHUNK)
+        )
+    return "\n\n".join(rewritten_parts)
+
+
 def generate_presentation(prompt: str) -> str:
     """Calls the backend's /generate-pptx endpoint and saves the returned
     file to a fresh temp directory (per-call, so concurrent chats can't
@@ -545,12 +611,27 @@ def chat_fn(message, history, hebrew_doc=False):
         user_text = message
         files = []
 
+    is_rewrite = _is_rewrite_request(user_text)
+
     file_context = ""
     if files:
         yield "📄 *Extracting text from the attached file(s)…*"
         file_context = extract_context_from_files(files, hebrew=hebrew_doc)
-        if len(file_context) > MAX_CONTEXT_CHARS:
+        # A rewrite request needs the WHOLE document, not a 6000-char
+        # preview -- truncating here was the main reason a 13-page document
+        # only ever came back as 1-2 pages: everything past ~6000 chars
+        # never even reached the model. Only truncate for normal Q&A-style
+        # attachments, where a preview is a reasonable tradeoff.
+        if not is_rewrite and len(file_context) > MAX_CONTEXT_CHARS:
             file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
+
+    if is_rewrite and file_context:
+        yield "✍️ *Rewriting the document in professional English (this can take a while for long documents)…*"
+        try:
+            yield rewrite_document_professionally(file_context)
+        except RuntimeError as e:
+            yield f"⚠️ {e}"
+        return
 
     # PowerPoint generation is handled as its own branch rather than folded
     # into the normal /chat call: it needs a structured JSON outline from
