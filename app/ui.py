@@ -2076,13 +2076,13 @@ def _logo_data_uri(path: str) -> str:
         return ""
 
 
-with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
+with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
     gr.HTML(
         f"""
         <div class="clara-header">
             <img src="{_logo_data_uri(LOGO_PATH)}" alt="logo" />
             <div class="clara-title">
-                <h1> LPJ AI Agent</h1>
+                <h1> AI Server - Ibrahim Z.</h1>
                 <p></p>
             </div>
         </div>
