@@ -1454,6 +1454,297 @@ def gdpr_chat_fn(message, history):
     yield answer, _format_gdpr_sources_panel(sources)
 
 
+# --- HIPAA AI (RAG over 45 CFR Parts 160 & 164) -----------------------------
+#
+# Same shape as GDPR AI / Canon AI just above -- pointed at HIPAA's
+# regulatory text (45 CFR Part 160, General Administrative Requirements, and
+# Part 164, Security and Privacy), scraped section-by-section via
+# scripts/scrape_hipaa.py and embedded via scripts/embed_hipaa_to_chroma.py.
+# Reuses the same generic embedding/re-ranking helpers as GDPR AI/Canon AI
+# (_embed_canon_query, _rerank_candidates, _tokenize, _lexical_overlap_score)
+# rather than duplicating them.
+#
+# One structural difference from GDPR/Canon: HIPAA's "article number"
+# equivalent -- the CFR section id, e.g. "164.312" -- is a STRING, not an
+# integer (unlike GDPR's plain 1..99 article_number), since CFR section
+# numbers aren't sequential integers. Metadata lookups below match on that
+# string directly rather than trying both str/int forms.
+#
+# Path/collection name here MUST match what embed_hipaa_to_chroma.py was run
+# with (--chroma-dir / --collection). Adjust if you used different values.
+HIPAA_CHROMA_DIR = str(Path(__file__).resolve().parent / "chroma_db")
+HIPAA_COLLECTION_NAME = "hipaa"
+
+# Same reasoning/tuning basis as _GDPR_TOP_K/_GDPR_FETCH_K -- wide enough
+# that a relevant-but-not-top-1 section isn't trimmed off before the LLM
+# ever sees it, without spending so much context on marginal matches.
+_HIPAA_TOP_K = 6
+_HIPAA_FETCH_K = 20
+
+# Model that answers using the retrieved sections. Pinned explicitly to
+# gpt-oss:20b for the same reason GDPR_MODEL/CANON_MODEL are pinned rather
+# than left to inherit main.py's OLLAMA_MODEL default.
+HIPAA_MODEL = "gpt-oss:20b"
+_HIPAA_NUM_PREDICT = 2048
+_HIPAA_REQUEST_TIMEOUT_SECONDS = 900
+
+HIPAA_SYSTEM_PROMPT = (
+    "You are a healthcare privacy / security compliance expert specializing "
+    "in HIPAA (the Health Insurance Portability and Accountability Act), as "
+    "implemented in its regulatory text at 45 CFR Part 160 (General "
+    "Administrative Requirements) and Part 164 (Security and Privacy, "
+    "covering the Privacy Rule, Security Rule, and Breach Notification "
+    "Rule). Think through and answer every question strictly according to "
+    "the sections provided to you below -- not from general recall of "
+    "privacy/security law, and not from the law of any other jurisdiction "
+    "or framework (e.g. GDPR, state privacy laws, HITECH provisions not "
+    "reflected in these sections), unless the user explicitly asks about "
+    "that instead.\n\n"
+    "For every substantive claim, cite the specific section (and "
+    "paragraph/point where relevant) you are relying on immediately after "
+    "the claim -- for example: 'Covered entities must implement unique "
+    "user identification for access to ePHI (45 CFR § 164.312(a)(2)(i)).' "
+    "Base your answer ONLY on the sections retrieved below plus general "
+    "background knowledge of HIPAA's structure -- never invent a section "
+    "number or a rule that isn't in the excerpts you were given. Note "
+    "where relevant whether an implementation specification is 'Required' "
+    "or 'Addressable' (45 CFR § 164.306(d)) when the retrieved text says "
+    "so, since that distinction materially affects compliance obligations. "
+    "If the retrieved sections don't actually answer the question, say so "
+    "explicitly instead of guessing -- a wrong or fabricated citation is "
+    "worse than admitting the retrieval didn't cover it.\n\n"
+    "Keep your answer proportionate to the question: for a broad or "
+    "general topic, cover the most important, directly relevant sections "
+    "rather than exhaustively enumerating every retrieved excerpt -- you "
+    "can offer to go deeper on a specific section if the user wants that.\n\n"
+    "You are not a substitute for advice from a qualified healthcare "
+    "compliance attorney or a Privacy/Security Officer, and you should say "
+    "so when a question calls for one. Always reply in the same language "
+    "the user's question is written in. Never switch languages on the "
+    "user unasked."
+)
+
+_HIPAA_SOURCES_PLACEHOLDER = (
+    "_No sections retrieved yet. Once you ask a question, the specific "
+    "HIPAA (45 CFR) sections retrieved from the vector database will be "
+    "listed here._"
+)
+_HIPAA_SOURCES_NONE_FOUND = (
+    "_Nothing was retrieved for this question -- the answer above (if any) "
+    "isn't grounded in a specific section. Try rephrasing._"
+)
+_HIPAA_DB_MISSING_MSG = (
+    "⚠️ HIPAA AI's vector database isn't available. Make sure you've run "
+    "scripts/scrape_hipaa.py then scripts/embed_hipaa_to_chroma.py (pointed "
+    f"at '{HIPAA_CHROMA_DIR}', collection '{HIPAA_COLLECTION_NAME}'), and "
+    "that chromadb is installed (`pip install chromadb`)."
+)
+
+_hipaa_collection_cache = None
+
+
+def _get_hipaa_collection():
+    """Lazily connect to the persistent Chroma collection, caching the
+    handle across calls. Returns None (rather than raising) on any
+    failure -- callers surface a clean in-chat error instead of crashing
+    the whole UI process if the vector DB hasn't been built yet."""
+    global _hipaa_collection_cache
+    if _hipaa_collection_cache is not None:
+        return _hipaa_collection_cache
+    if chromadb is None:
+        return None
+    try:
+        client = chromadb.PersistentClient(path=HIPAA_CHROMA_DIR)
+        _hipaa_collection_cache = client.get_collection(HIPAA_COLLECTION_NAME)
+        return _hipaa_collection_cache
+    except Exception as e:
+        import traceback
+        print(f"[HIPAA AI] failed to open Chroma collection at "
+              f"'{HIPAA_CHROMA_DIR}' / '{HIPAA_COLLECTION_NAME}': {e}")
+        traceback.print_exc()
+        return None
+
+
+# Matches a CFR section reference in a question: "45 CFR 164.312",
+# "§ 164.312", "section 164.312", "164.312(a)(2)" -- captures just the
+# leading {part}.{section} id (an optional trailing letter, e.g. "164.520a",
+# is included; any paragraph suffix like "(a)(2)" is ignored for lookup
+# purposes, same reasoning as GDPR's article-number regex).
+_HIPAA_SECTION_NUMBER_RE = re.compile(r"\b(1(?:60|62|64)\.\d{1,4}[a-zA-Z]?)\b")
+
+
+def retrieve_hipaa(query: str, n_results: int = _HIPAA_TOP_K):
+    """
+    Retrieves relevant HIPAA (45 CFR) sections for a query, combining two
+    strategies (same overall approach as retrieve_gdpr/retrieve_canons):
+
+    1. Exact match: if the query names a specific section id (e.g.
+       "164.312" or "§ 160.103"), that section is fetched directly via a
+       metadata filter and placed first.
+    2. Semantic search + hybrid re-rank: the query is embedded with
+       nomic-embed-text (via the shared _embed_canon_query helper),
+       _HIPAA_FETCH_K candidates are pulled by vector similarity, then
+       re-scored by blending vector similarity with lexical keyword
+       overlap and filtered for diversity (via the shared
+       _rerank_candidates helper), before trimming down to n_results.
+
+    Returns (context_text, sources) -- or (None, None) on any failure
+    (missing DB, unreachable Ollama, etc.), which callers turn into a
+    clear in-chat message rather than a silent empty answer.
+    """
+    collection = _get_hipaa_collection()
+    if collection is None:
+        return None, None
+
+    exact_docs, exact_metas = [], []
+    for section_id in dict.fromkeys(_HIPAA_SECTION_NUMBER_RE.findall(query)):  # dedupe, keep order
+        try:
+            hit = collection.get(where={"section_id": section_id})
+        except Exception:
+            continue
+        for doc, meta in zip(hit.get("documents") or [], hit.get("metadatas") or []):
+            exact_docs.append(doc)
+            exact_metas.append(meta)
+
+    query_vector = _embed_canon_query(query)  # generic nomic-embed-text helper, reused as-is
+    if query_vector is None and not exact_docs:
+        return None, None
+
+    vector_docs, vector_metas = [], []
+    if query_vector is not None:
+        try:
+            results = collection.query(
+                query_embeddings=[query_vector],
+                n_results=_HIPAA_FETCH_K,
+                include=["documents", "metadatas", "distances"],
+            )
+            raw_docs = (results.get("documents") or [[]])[0]
+            raw_metas = (results.get("metadatas") or [[]])[0]
+            raw_dists = (results.get("distances") or [[]])[0]
+            vector_docs, vector_metas = _rerank_candidates(
+                query, raw_docs, raw_metas, raw_dists, top_n=n_results
+            )
+        except Exception:
+            pass  # exact matches (if any) still make it through below
+
+    # Merge exact matches first, then vector results, de-duping by section
+    # id so a section named explicitly doesn't also show up twice.
+    seen = set()
+    documents, metadatas = [], []
+    for doc, meta in zip(exact_docs + vector_docs, exact_metas + vector_metas):
+        key = meta.get("section_id", "?")
+        if key in seen:
+            continue
+        seen.add(key)
+        documents.append(doc)
+        metadatas.append(meta)
+
+    if not documents:
+        return "", []
+
+    context_parts = []
+    sources = []
+    for doc, meta in zip(documents, metadatas):
+        section_id = meta.get("section_id", "?")
+        title = meta.get("title", "")
+        path = meta.get("hierarchy_path", "")
+        url = meta.get("source_url", "")
+        cross_refs = meta.get("cross_references", "")
+        context_parts.append(f"[45 CFR § {section_id} -- {title}] ({path})\n{doc}")
+        sources.append({
+            "section_id": section_id, "title": title, "hierarchy_path": path,
+            "source_url": url, "cross_references": cross_refs,
+        })
+
+    context_text = "\n\n---\n\n".join(context_parts)
+    return context_text, sources
+
+
+def _format_hipaa_sources_panel(sources: list[dict] | None) -> str:
+    if not sources:
+        return _HIPAA_SOURCES_NONE_FOUND
+    lines = []
+    for s in sources:
+        line = f"- **45 CFR § {s['section_id']}** — {s['title']}"
+        if s.get("hierarchy_path"):
+            line += f"  \n  {s['hierarchy_path']}"
+        if s.get("source_url"):
+            line += f"  \n  [{s['source_url']}]({s['source_url']})"
+        if s.get("cross_references"):
+            line += f"  \n  🔗 Cross-references: {s['cross_references']}"
+        lines.append(line)
+    return "\n\n".join(lines)
+
+
+def hipaa_chat_fn(message, history):
+    """
+    RAG chat over the scraped/embedded HIPAA regulatory text. Not
+    multimodal (no file attachment) -- same reasoning as
+    canon_chat_fn/gdpr_chat_fn: the point of this tab is grounding answers
+    in the pre-built vector database, not whatever the user happens to
+    attach.
+
+    Returns (answer, sources_panel_markdown) -- see hipaa_sources_panel's
+    wiring below, same additional_outputs pattern as Canon AI / GDPR AI.
+    """
+    user_text = message.get("text", message) if isinstance(message, dict) else message
+
+    if chromadb is None or _get_hipaa_collection() is None:
+        yield _HIPAA_DB_MISSING_MSG, gr.skip()
+        return
+
+    yield "🔍 *Searching ChromaDB for HIPAA sections relevant to your question…*", gr.skip()
+
+    context_text, sources = retrieve_hipaa(user_text)
+    if context_text is None:
+        yield _HIPAA_DB_MISSING_MSG, gr.skip()
+        return
+
+    n_found = len(sources) if sources else 0
+    if n_found:
+        yield (
+            f"🏥 *Found {n_found} relevant section(s) — asking the model to "
+            f"answer using them…*",
+            gr.skip(),
+        )
+    else:
+        yield "🤔 *Nothing matched in the vector database — asking the model how to proceed…*", gr.skip()
+
+    clean_history = [
+        {"role": turn["role"], "content": turn["content"]}
+        for turn in history
+        if isinstance(turn.get("content"), str)
+    ]
+
+    if context_text:
+        combined_message = (
+            f"Retrieved HIPAA (45 CFR) sections relevant to the question:\n\n{context_text}\n\n"
+            f"User question: {user_text}"
+        )
+    else:
+        combined_message = (
+            "No HIPAA sections were retrieved for this question -- tell "
+            f"the user that plainly instead of guessing.\n\nUser question: {user_text}"
+        )
+
+    messages = (
+        [{"role": "system", "content": HIPAA_SYSTEM_PROMPT}]
+        + clean_history
+        + [{"role": "user", "content": combined_message}]
+    )
+    try:
+        answer = _chat_backend(
+            messages, model=HIPAA_MODEL, num_predict=_HIPAA_NUM_PREDICT,
+            timeout=_HIPAA_REQUEST_TIMEOUT_SECONDS,
+            timeout_hint="try a narrower question about a specific section or topic.",
+        )
+    except RuntimeError as e:
+        yield f"⚠️ {e}", gr.skip()
+        return
+
+    yield answer, _format_hipaa_sources_panel(sources)
+
+
 def set_hebrew_from_source_lang(source_lang):
     """
     Fires on the Translate tab's Source language dropdown. Hebrew/Tesseract
@@ -1965,7 +2256,9 @@ with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
     with gr.Tab("GDPR AI"):
         gr.Markdown(
             "Chat about the **GDPR** (Regulation (EU) 2016/679), grounded "
-            "in a local vector database built from the official article text"
+            "in a local vector database built from the official article "
+            "text (RAG — Retrieval-Augmented Generation via ChromaDB + "
+            "nomic-embed-text, answered by gpt-oss:20b).\n\n"
             "⚠️ Answers are only as good as what's retrieved. This is not "
             "a substitute for advice from a qualified data protection "
             "lawyer or DPO. Always verify against the actual article text "
@@ -1981,6 +2274,31 @@ with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
             with gr.Column(scale=1):
                 gr.Markdown("### 📜 Articles retrieved")
                 gdpr_sources_panel.render()
+
+    with gr.Tab("HIPAA AI"):
+        gr.Markdown(
+            "Chat about **HIPAA** (45 CFR Part 160 — General Administrative "
+            "Requirements, and Part 164 — Security and Privacy, covering "
+            "the Privacy, Security, and Breach Notification Rules), "
+            "grounded in a local vector database built from the official "
+            "regulatory text (RAG — Retrieval-Augmented Generation via "
+            "ChromaDB + nomic-embed-text, answered by gpt-oss:20b).\n\n"
+            "⚠️ Answers are only as good as what's retrieved. This is not "
+            "a substitute for advice from a qualified healthcare "
+            "compliance attorney or Privacy/Security Officer. Always "
+            "verify against the actual regulatory text (linked in "
+            "Sources) for anything consequential."
+        )
+        hipaa_sources_panel = gr.Markdown(_HIPAA_SOURCES_PLACEHOLDER, render=False)
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.ChatInterface(
+                    fn=hipaa_chat_fn, type="messages",
+                    additional_outputs=[hipaa_sources_panel],
+                )
+            with gr.Column(scale=1):
+                gr.Markdown("### 🏥 Sections retrieved")
+                hipaa_sources_panel.render()
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
