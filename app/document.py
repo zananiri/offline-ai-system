@@ -66,6 +66,18 @@ def _tesseract_available() -> bool:
 class TesseractNotAvailableError(RuntimeError):
     """Raised when Hebrew OCR is requested but Tesseract isn't installed/found."""
 
+
+class OCRProducedNoTextError(RuntimeError):
+    """
+    Raised when OCR ran successfully (no engine/dependency failure) but
+    detected essentially no text at all -- e.g. RapidOCR's text detector
+    finding zero regions on a rotated, blank, or very low-contrast scan.
+    Distinct from TesseractNotAvailableError (a setup problem) -- this is
+    a document-quality problem, and callers should surface it as a clear,
+    actionable message instead of silently passing a near-empty document
+    downstream to translation/chat/the Legal model.
+    """
+
 # --- Default converter: RapidOCR via Docling (higher accuracy, no Hebrew support) ---
 _default_pipeline_options = PdfPipelineOptions()
 _default_pipeline_options.do_ocr = True
@@ -236,6 +248,49 @@ def _extract_native_pdf_text(file_path: str) -> str | None:
     if hebrew_ratio < _HEBREW_SCRIPT_RATIO_THRESHOLD:
         return None
 
+    return text
+
+
+def _extract_native_pdf_text_any_lang(file_path: str) -> str | None:
+    """
+    Same idea as _extract_native_pdf_text, but WITHOUT the Hebrew-script
+    ratio filter -- used by the default (non-Hebrew) conversion path so a
+    normal digitally-authored PDF (English, mixed-language, etc.) skips
+    OCR entirely whenever it already has a usable embedded text layer,
+    instead of always re-rendering and re-OCR'ing pixels that are already
+    perfect text. This is strictly better than OCR when available: faster,
+    and avoids OCR misreads on text that didn't need recognizing at all.
+
+    Returns None (caller falls back to real OCR) if there's no text layer,
+    or it's too short to be a real content page (see _MIN_NATIVE_TEXT_CHARS).
+
+    Uses pypdfium2, not pypdf, for the same reason _extract_native_pdf_text
+    does: pypdfium2's text extraction returns logical reading order, while
+    pypdf can return visual left-to-right order for RTL-authored content,
+    silently reversing word order within a line.
+    """
+    try:
+        pdf = pdfium.PdfDocument(file_path)
+    except Exception:
+        return None
+
+    page_texts = []
+    try:
+        for page in pdf:
+            textpage = page.get_textpage()
+            try:
+                page_texts.append(textpage.get_text_range())
+            finally:
+                textpage.close()
+                page.close()
+    except Exception:
+        return None
+    finally:
+        pdf.close()
+
+    text = "\n\n".join(page_texts).strip()
+    if len(text) < _MIN_NATIVE_TEXT_CHARS:
+        return None
     return text
 
 
@@ -490,12 +545,39 @@ def convert_to_markdown(file_path: str, hebrew: bool = False) -> str:
     if hebrew and Path(file_path).suffix.lower() in _OCR_INPUT_EXTS:
         return _ocr_hebrew(file_path)
 
+    # Skip OCR entirely when a PDF already has a usable native text layer --
+    # cheaper and more accurate than rendering+re-OCR'ing pixels that are
+    # already perfect text. Only applies to PDFs; DOCX/PPTX/images already
+    # either have no OCR step (DOCX/PPTX) or genuinely need it (images).
+    if Path(file_path).suffix.lower() == ".pdf":
+        native_text = _extract_native_pdf_text_any_lang(file_path)
+        if native_text is not None:
+            print(f"[document] {Path(file_path).name}: native PDF text layer found, skipping OCR.")
+            return strip_bidi_controls(strip_ocr_noise(html.unescape(native_text)))
+        print(f"[document] {Path(file_path).name}: no usable native text layer, running OCR.")
+
     result = _default_converter.convert(Path(file_path))
     markdown_text = html.unescape(result.document.export_to_markdown())
     # Defensive: same bidi-control-character cleanup as the Hebrew/Tesseract
     # path, applied here too in case RapidOCR ever emits stray marks on
     # Arabic (or any other RTL-script) content.
-    return strip_bidi_controls(markdown_text)
+    markdown_text = strip_bidi_controls(markdown_text)
+
+    # RapidOCR's text detector can legitimately find nothing at all -- a
+    # blank page, a rotated scan, or a very low-contrast/low-resolution
+    # image (confirmed in practice: "The text detection result is empty" /
+    # "RapidOCR returned empty result!" in the RapidOCR log, with zero
+    # downstream error). Without this check, a near-empty document silently
+    # flows into translation/chat/the Legal model instead of surfacing the
+    # real problem (bad scan) to the user.
+    if len(markdown_text.strip()) < 20:
+        raise OCRProducedNoTextError(
+            "OCR found no readable text in this document. This usually means "
+            "the scan is blank, rotated, or too low-quality/low-contrast for "
+            "the OCR engine to read. Try re-scanning at a higher resolution, "
+            "check the page orientation, or use a clearer source file."
+        )
+    return markdown_text
 
 
 def _paragraph_is_rtl(text: str, threshold: float = 0.3) -> bool:

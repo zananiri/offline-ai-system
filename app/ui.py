@@ -1162,6 +1162,298 @@ def canon_chat_fn(message, history):
     yield answer, _format_canon_sources_panel(sources)
 
 
+# --- GDPR AI (RAG over the GDPR -- Regulation (EU) 2016/679) ---------------
+#
+# Same shape as Canon AI just above (retrieve -> ground -> answer over a
+# pre-built local vector store), pointed at a different corpus: the GDPR's
+# 99 articles, scraped article-by-article via scripts/scrape_gdpr.py and
+# embedded via scripts/embed_gdpr_to_chroma.py. Deliberately reuses Canon
+# AI's embedding/re-ranking machinery rather than duplicating it --
+# _embed_canon_query, _rerank_candidates, _tokenize, _lexical_overlap_score,
+# and _strip_accents are all already fully generic (nomic-embed-text via
+# Ollama, hybrid vector+lexical scoring with a diversity filter): nothing
+# about them is actually canon-specific despite the name, so the GDPR
+# collection below just calls straight into them.
+#
+# Path/collection name here MUST match what embed_gdpr_to_chroma.py was run
+# with (--chroma-dir / --collection). Adjust if you used different values.
+GDPR_CHROMA_DIR = str(Path(__file__).resolve().parent / "chroma_db")
+GDPR_COLLECTION_NAME = "gdpr"
+
+# How many articles to retrieve per question -- same reasoning/tuning basis
+# as _CANON_TOP_K/_CANON_FETCH_K (see those comments): wide enough that a
+# relevant-but-not-top-1 article isn't trimmed off before the LLM ever sees
+# it, without spending so much context on marginal matches that latency/
+# prompt size suffers. Re-tune per corpus size if this ever grows past the
+# GDPR's fixed 99 articles (e.g. if implementing acts/case law are added).
+_GDPR_TOP_K = 6
+_GDPR_FETCH_K = 20
+
+# Model that answers using the retrieved articles. Pinned explicitly to
+# gpt-oss:20b (same model backing Chat and Canon AI) for the same reason
+# CANON_MODEL is pinned rather than left to inherit main.py's OLLAMA_MODEL
+# default: GDPR AI is meant to share this model deliberately, and staying
+# explicit here means that stays true even if OLLAMA_MODEL is later
+# repurposed in main.py for something unrelated (e.g. invoice classification).
+GDPR_MODEL = "gpt-oss:20b"
+_GDPR_NUM_PREDICT = 2048
+_GDPR_REQUEST_TIMEOUT_SECONDS = 900
+
+GDPR_SYSTEM_PROMPT = (
+    "You are a data protection / privacy law expert specializing in the EU "
+    "General Data Protection Regulation (Regulation (EU) 2016/679, the "
+    "'GDPR'). Think through and answer every question strictly according "
+    "to the GDPR articles provided to you below -- not from general recall "
+    "of privacy law, and not from the law of any other jurisdiction (e.g. "
+    "CCPA, UK GDPR post-Brexit divergence, national implementing laws), "
+    "unless the user explicitly asks about that instead.\n\n"
+    "For every substantive claim, cite the specific article (and "
+    "paragraph/point where relevant) you are relying on immediately after "
+    "the claim -- for example: 'Processing must have a lawful basis such "
+    "as consent or legitimate interest (Art. 6(1) GDPR).' Base your answer "
+    "ONLY on the articles retrieved below plus general background "
+    "knowledge of the GDPR's structure -- never invent an article number "
+    "or a rule that isn't in the excerpts you were given. If the retrieved "
+    "articles don't actually answer the question, say so explicitly "
+    "instead of guessing -- a wrong or fabricated citation is worse than "
+    "admitting the retrieval didn't cover it.\n\n"
+    "Keep your answer proportionate to the question: for a broad or "
+    "general topic, cover the most important, directly relevant articles "
+    "rather than exhaustively enumerating every retrieved excerpt -- you "
+    "can offer to go deeper on a specific article if the user wants that.\n\n"
+    "You are not a substitute for advice from a qualified data protection "
+    "lawyer or a Data Protection Officer, and you should say so when a "
+    "question calls for one. Always reply in the same language the user's "
+    "question is written in. Never switch languages on the user unasked."
+)
+
+_GDPR_SOURCES_PLACEHOLDER = (
+    "_No articles retrieved yet. Once you ask a question, the specific "
+    "GDPR articles retrieved from the vector database will be listed here._"
+)
+_GDPR_SOURCES_NONE_FOUND = (
+    "_Nothing was retrieved for this question -- the answer above (if any) "
+    "isn't grounded in a specific article. Try rephrasing._"
+)
+_GDPR_DB_MISSING_MSG = (
+    "⚠️ GDPR AI's vector database isn't available. Make sure you've run "
+    "scripts/scrape_gdpr.py then scripts/embed_gdpr_to_chroma.py (pointed "
+    f"at '{GDPR_CHROMA_DIR}', collection '{GDPR_COLLECTION_NAME}'), and "
+    "that chromadb is installed (`pip install chromadb`)."
+)
+
+_gdpr_collection_cache = None
+
+
+def _get_gdpr_collection():
+    """Lazily connect to the persistent Chroma collection, caching the
+    handle across calls. Returns None (rather than raising) on any
+    failure -- callers surface a clean in-chat error instead of crashing
+    the whole UI process if the vector DB hasn't been built yet."""
+    global _gdpr_collection_cache
+    if _gdpr_collection_cache is not None:
+        return _gdpr_collection_cache
+    if chromadb is None:
+        return None
+    try:
+        client = chromadb.PersistentClient(path=GDPR_CHROMA_DIR)
+        _gdpr_collection_cache = client.get_collection(GDPR_COLLECTION_NAME)
+        return _gdpr_collection_cache
+    except Exception as e:
+        import traceback
+        print(f"[GDPR AI] failed to open Chroma collection at "
+              f"'{GDPR_CHROMA_DIR}' / '{GDPR_COLLECTION_NAME}': {e}")
+        traceback.print_exc()
+        return None
+
+
+# Matches how an article is named in a question: "Article 6", "Art. 6",
+# "art 6", "GDPR Art 6", "article 6(1)(f)" -- captures just the leading
+# article number; any paragraph/point suffix like "(1)(f)" is ignored for
+# lookup purposes (retrieval is per-article, not per-sub-paragraph) but the
+# user's phrasing still matches fine since the number itself is what's
+# extracted.
+_GDPR_ARTICLE_NUMBER_RE = re.compile(r"\bart(?:icles?)?\.?\s*(\d{1,3})\b", re.IGNORECASE)
+
+
+def retrieve_gdpr(query: str, n_results: int = _GDPR_TOP_K):
+    """
+    Retrieves relevant GDPR articles for a query, combining two strategies
+    (same overall approach as retrieve_canons -- see that function's
+    docstring for the full reasoning):
+
+    1. Exact match: if the query names a specific article number (e.g.
+       "Article 6" or "art. 17"), that article is fetched directly via a
+       metadata filter and placed first. Vector similarity alone is
+       unreliable for exact lookups.
+    2. Semantic search + hybrid re-rank: the query is embedded with
+       nomic-embed-text (via the shared _embed_canon_query helper),
+       _GDPR_FETCH_K candidates are pulled by vector similarity, then
+       re-scored by blending vector similarity with lexical keyword
+       overlap and filtered for diversity (via the shared
+       _rerank_candidates helper), before trimming down to n_results.
+
+    Returns (context_text, sources) where sources is a list of dicts used
+    to build the sidebar panel -- or (None, None) on any failure (missing
+    DB, unreachable Ollama, etc.), which callers turn into a clear in-chat
+    message rather than a silent empty answer.
+    """
+    collection = _get_gdpr_collection()
+    if collection is None:
+        return None, None
+
+    exact_docs, exact_metas = [], []
+    for art_num in dict.fromkeys(_GDPR_ARTICLE_NUMBER_RE.findall(query)):  # dedupe, keep order
+        for candidate in (art_num, int(art_num)):  # metadata may be str or int
+            try:
+                hit = collection.get(where={"article_number": candidate})
+            except Exception:
+                continue
+            for doc, meta in zip(hit.get("documents") or [], hit.get("metadatas") or []):
+                exact_docs.append(doc)
+                exact_metas.append(meta)
+            if hit.get("documents"):
+                break  # found it under this type, no need to try the other
+
+    query_vector = _embed_canon_query(query)  # generic nomic-embed-text helper, reused as-is
+    if query_vector is None and not exact_docs:
+        return None, None
+
+    vector_docs, vector_metas = [], []
+    if query_vector is not None:
+        try:
+            results = collection.query(
+                query_embeddings=[query_vector],
+                n_results=_GDPR_FETCH_K,
+                include=["documents", "metadatas", "distances"],
+            )
+            raw_docs = (results.get("documents") or [[]])[0]
+            raw_metas = (results.get("metadatas") or [[]])[0]
+            raw_dists = (results.get("distances") or [[]])[0]
+            vector_docs, vector_metas = _rerank_candidates(
+                query, raw_docs, raw_metas, raw_dists, top_n=n_results
+            )
+        except Exception:
+            pass  # exact matches (if any) still make it through below
+
+    # Merge exact matches first, then vector results, de-duping by article
+    # number so an article named explicitly doesn't also show up twice.
+    seen = set()
+    documents, metadatas = [], []
+    for doc, meta in zip(exact_docs + vector_docs, exact_metas + vector_metas):
+        key = meta.get("article_number", "?")
+        if key in seen:
+            continue
+        seen.add(key)
+        documents.append(doc)
+        metadatas.append(meta)
+
+    if not documents:
+        return "", []
+
+    context_parts = []
+    sources = []
+    for doc, meta in zip(documents, metadatas):
+        art_num = meta.get("article_number", "?")
+        title = meta.get("title", "")
+        path = meta.get("hierarchy_path", "")
+        url = meta.get("source_url", "")
+        recitals = meta.get("recitals", "")
+        context_parts.append(f"[Art. {art_num} -- {title}] ({path})\n{doc}")
+        sources.append({
+            "article_number": art_num, "title": title, "hierarchy_path": path,
+            "source_url": url, "recitals": recitals,
+        })
+
+    context_text = "\n\n---\n\n".join(context_parts)
+    return context_text, sources
+
+
+def _format_gdpr_sources_panel(sources: list[dict] | None) -> str:
+    if not sources:
+        return _GDPR_SOURCES_NONE_FOUND
+    lines = []
+    for s in sources:
+        line = f"- **Art. {s['article_number']}** — {s['title']}"
+        if s.get("hierarchy_path"):
+            line += f"  \n  {s['hierarchy_path']}"
+        if s.get("source_url"):
+            line += f"  \n  [{s['source_url']}]({s['source_url']})"
+        if s.get("recitals"):
+            line += f"  \n  📎 Recitals: {s['recitals']}"
+        lines.append(line)
+    return "\n\n".join(lines)
+
+
+def gdpr_chat_fn(message, history):
+    """
+    RAG chat over the scraped/embedded GDPR. Not multimodal (no file
+    attachment) -- same reasoning as canon_chat_fn: the point of this tab
+    is grounding answers in the pre-built vector database, not whatever
+    the user happens to attach.
+
+    Returns (answer, sources_panel_markdown) -- see gdpr_sources_panel's
+    wiring below, same additional_outputs pattern as Canon AI / the
+    Attorney tabs' citations panel.
+    """
+    user_text = message.get("text", message) if isinstance(message, dict) else message
+
+    if chromadb is None or _get_gdpr_collection() is None:
+        yield _GDPR_DB_MISSING_MSG, gr.skip()
+        return
+
+    yield "🔍 *Searching ChromaDB for GDPR articles relevant to your question…*", gr.skip()
+
+    context_text, sources = retrieve_gdpr(user_text)
+    if context_text is None:
+        yield _GDPR_DB_MISSING_MSG, gr.skip()
+        return
+
+    n_found = len(sources) if sources else 0
+    if n_found:
+        yield (
+            f"📜 *Found {n_found} relevant article(s) — asking the model to "
+            f"answer using them…*",
+            gr.skip(),
+        )
+    else:
+        yield "🤔 *Nothing matched in the vector database — asking the model how to proceed…*", gr.skip()
+
+    clean_history = [
+        {"role": turn["role"], "content": turn["content"]}
+        for turn in history
+        if isinstance(turn.get("content"), str)
+    ]
+
+    if context_text:
+        combined_message = (
+            f"Retrieved GDPR articles relevant to the question:\n\n{context_text}\n\n"
+            f"User question: {user_text}"
+        )
+    else:
+        combined_message = (
+            "No GDPR articles were retrieved for this question -- tell the "
+            f"user that plainly instead of guessing.\n\nUser question: {user_text}"
+        )
+
+    messages = (
+        [{"role": "system", "content": GDPR_SYSTEM_PROMPT}]
+        + clean_history
+        + [{"role": "user", "content": combined_message}]
+    )
+    try:
+        answer = _chat_backend(
+            messages, model=GDPR_MODEL, num_predict=_GDPR_NUM_PREDICT,
+            timeout=_GDPR_REQUEST_TIMEOUT_SECONDS,
+            timeout_hint="try a narrower question about a specific article or topic.",
+        )
+    except RuntimeError as e:
+        yield f"⚠️ {e}", gr.skip()
+        return
+
+    yield answer, _format_gdpr_sources_panel(sources)
+
+
 def set_hebrew_from_source_lang(source_lang):
     """
     Fires on the Translate tab's Source language dropdown. Hebrew/Tesseract
@@ -1669,6 +1961,26 @@ with gr.Blocks(title="LPJ AI Agent", theme=CLARA_THEME, css=CLARA_CSS) as demo:
             with gr.Column(scale=1):
                 gr.Markdown("### 📖 Canons retrieved")
                 canon_sources_panel.render()
+
+    with gr.Tab("GDPR AI"):
+        gr.Markdown(
+            "Chat about the **GDPR** (Regulation (EU) 2016/679), grounded "
+            "in a local vector database built from the official article text"
+            "⚠️ Answers are only as good as what's retrieved. This is not "
+            "a substitute for advice from a qualified data protection "
+            "lawyer or DPO. Always verify against the actual article text "
+            "(linked in Sources) for anything consequential."
+        )
+        gdpr_sources_panel = gr.Markdown(_GDPR_SOURCES_PLACEHOLDER, render=False)
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.ChatInterface(
+                    fn=gdpr_chat_fn, type="messages",
+                    additional_outputs=[gdpr_sources_panel],
+                )
+            with gr.Column(scale=1):
+                gr.Markdown("### 📜 Articles retrieved")
+                gdpr_sources_panel.render()
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)

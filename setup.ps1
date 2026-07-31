@@ -99,7 +99,15 @@ Write-Host "Exact resolved versions written to requirements.lock.txt" -Foregroun
 # ---------------------------------------------------------------------------
 # 4. Pull the Ollama models (needs internet once; fully offline after this)
 # ---------------------------------------------------------------------------
-Write-Host "Starting Ollama service..." -ForegroundColor Yellow
+Write-Host "Starting Ollama service (iGPU offload + RAM tuning enabled)..." -ForegroundColor Yellow
+# See run.ps1's matching comment for why each of these is set -- this
+# machine has no usable discrete GPU and sits close to its RAM ceiling with
+# this app's larger models (esp. the Legal tab's 24B model), so these are
+# set from first run onward, not just added later in run.ps1.
+$env:OLLAMA_IGPU_ENABLE = "1"
+$env:OLLAMA_MAX_LOADED_MODELS = "1"
+$env:OLLAMA_KEEP_ALIVE = "2m"
+$env:OLLAMA_KV_CACHE_TYPE = "q8_0"
 Start-Process -NoNewWindow ollama serve
 Start-Sleep -Seconds 5
 

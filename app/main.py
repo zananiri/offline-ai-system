@@ -23,6 +23,7 @@ from app.document import (
     convert_file_to_docx,
     resolve_hebrew_flag,
     TesseractNotAvailableError,
+    OCRProducedNoTextError,
 )
 from app.translate import get_translator, LANGUAGES
 from app.pptx_generator import generate_pptx
@@ -110,6 +111,14 @@ _ollama_client = ollama.Client(timeout=_OLLAMA_REQUEST_TIMEOUT_SECONDS)
 # num_predict + the prompt (system prompt + history + any attached-document
 # text) so num_predict is the thing that actually stops generation.
 _DEFAULT_NUM_CTX = 8192
+# NOTE: the Legal tab's own, larger context window (_LEGAL_NUM_CTX) lives in
+# app/ui.py, since ui.py is the caller that explicitly requests it via the
+# num_ctx param below. See ui.py's comment for why it was trimmed from
+# 16384 -> 11264: on this machine (32GB RAM, no usable GPU offload -- see
+# run.ps1/setup.ps1's OLLAMA_IGPU_ENABLE note), RAM is already ~85% used at
+# idle, and a 24B model's KV cache at 16384 tokens pushed total memory use
+# past what's physically free, causing pagefile-swapped (very slow) CPU
+# inference instead of an actual compute bottleneck.
 
 
 def _num_ctx_for(num_predict: int, requested: int | None) -> int:
@@ -164,6 +173,11 @@ def _convert_to_markdown_or_503(path: str, hebrew: bool) -> str:
         return convert_to_markdown(path, hebrew=hebrew)
     except TesseractNotAvailableError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except OCRProducedNoTextError as e:
+        # 422 (Unprocessable Entity): the request/upload itself was fine,
+        # but the document's content couldn't be read -- distinct from a
+        # 503 (service/dependency unavailable) or a raw 500 (bug).
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @app.get("/health")
