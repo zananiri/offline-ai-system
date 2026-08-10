@@ -167,6 +167,14 @@ LEGAL_SYSTEM_PROMPT = (
     "not confident of the exact statute, section number, or case citation, say "
     "so explicitly instead of inventing one -- a wrong or fabricated citation "
     "is worse than admitting uncertainty.\n\n"
+    "You may also be given retrieved statute excerpts below, pulled "
+    "directly from the Knesset's official legislation database. When they "
+    "are relevant to the question, prefer citing and quoting from those "
+    "exact excerpts (including the סעיף/section number given) over relying "
+    "on general recall -- they are authoritative and more current than "
+    "your training data. If no excerpts were retrieved, or the retrieved "
+    "excerpts don't actually cover the question, say so explicitly rather "
+    "than presenting an uncited claim as if it came from them.\n\n"
     "Keep your answer proportionate to the question: for a broad or general "
     "topic, cover the most important, directly relevant points rather than "
     "exhaustively enumerating every provision of a law -- you can offer to go "
@@ -683,14 +691,27 @@ def chat_fn(message, history, hebrew_doc=False):
 def legal_chat_fn(message, history, hebrew_doc=False):
     """
     Same shape as chat_fn, but routed to LEGAL_MODEL (DictaLM-3.0-24B-Thinking)
-    with a light legal-assistant system prompt. Kept as a separate function
-    (rather than parameterizing chat_fn) so the two tabs can diverge later
-    without threading a model choice through the general Chat tab's UI.
+    with a legal-assistant system prompt, now RAG-grounded on Israeli
+    statute text retrieved from the Knesset OData-sourced ChromaDB
+    collection (see retrieve_knesset_laws above).
 
-    Returns (answer, citations_panel_markdown) -- the second value feeds the
-    Legal tab's sidebar via gr.ChatInterface's additional_outputs, so any
-    citation-shaped text in the answer shows up as its own list on the
-    right instead of only being visible inline in the chat transcript.
+    Returns (answer, citations_panel_markdown, knesset_sources_panel_markdown)
+    -- three outputs via ChatInterface's additional_outputs: the existing
+    regex-based "did the answer cite anything" panel, plus a panel showing
+    what was actually retrieved from the law database for this question
+    (distinct things: the citations panel can't tell a real citation from
+    a fabricated one; the sources panel shows what was actually fed to the
+    model as grounding).
+
+    Every returned answer -- grounded or not -- gets a disclaimer footer
+    appended (_KNESSET_DISCLAIMER_GROUNDED / _KNESSET_DISCLAIMER_UNGROUNDED),
+    on top of the existing _NO_CITATION_NOTE. The two notes cover different
+    failure modes: _NO_CITATION_NOTE fires when the ANSWER text itself
+    doesn't look like it cites anything; the Knesset disclaimer fires based
+    on whether real grounding was actually RETRIEVED for this question,
+    regardless of what the model's prose ends up looking like -- an answer
+    can look citation-shaped while still being ungrounded, so both checks
+    run independently and either or both notes can be appended.
     """
     if isinstance(message, dict):
         user_text = message.get("text", "")
@@ -701,10 +722,22 @@ def legal_chat_fn(message, history, hebrew_doc=False):
 
     file_context = ""
     if files:
-        yield "📄 *Extracting text from the attached file(s)…*", gr.skip()
+        yield "📄 *Extracting text from the attached file(s)…*", gr.skip(), gr.skip()
         file_context = extract_context_from_files(files, hebrew=hebrew_doc)
         if len(file_context) > MAX_CONTEXT_CHARS:
             file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
+
+    yield "📚 *Searching the Knesset legislation database…*", gr.skip(), gr.skip()
+    law_context, law_sources = retrieve_knesset_laws(user_text)
+    n_found = len(law_sources) if law_sources else 0
+    if law_context is None:
+        # DB unavailable/unreachable -- degrade gracefully, don't block the tab.
+        status = "⚖️ *Knesset database unavailable — answering from DictaLM's own knowledge…*"
+    elif n_found:
+        status = f"⚖️ *Found {n_found} relevant statute excerpt(s) — consulting AI…*"
+    else:
+        status = "⚖️ *Nothing matched in the Knesset database — consulting AI…*"
+    yield status, gr.skip(), gr.skip()
 
     clean_history = [
         {"role": turn["role"], "content": turn["content"]}
@@ -712,20 +745,22 @@ def legal_chat_fn(message, history, hebrew_doc=False):
         if isinstance(turn.get("content"), str)
     ]
 
-    if file_context:
-        combined_message = (
-            f"The user attached the following document(s):\n\n{file_context}\n\n"
-            f"User question: {user_text}"
+    message_parts = []
+    if law_context:
+        message_parts.append(
+            f"Retrieved Israeli statute excerpts relevant to the question "
+            f"(from the Knesset's official legislation database):\n\n{law_context}"
         )
-    else:
-        combined_message = user_text
+    if file_context:
+        message_parts.append(f"The user attached the following document(s):\n\n{file_context}")
+    message_parts.append(f"User question: {user_text}")
+    combined_message = "\n\n".join(message_parts)
 
     messages = (
         [{"role": "system", "content": LEGAL_SYSTEM_PROMPT}]
         + clean_history
         + [{"role": "user", "content": combined_message}]
     )
-    yield "⚖️ *Consulting AI… this can take several minutes on CPU.*", gr.skip()
     try:
         answer = _chat_backend(
             messages, model=LEGAL_MODEL, num_predict=_LEGAL_NUM_PREDICT,
@@ -733,13 +768,15 @@ def legal_chat_fn(message, history, hebrew_doc=False):
             timeout_hint="try a narrower question -- e.g. ask about a specific section rather than a whole law.",
         )
     except RuntimeError as e:
-        yield f"⚠️ {e}", gr.skip()
+        yield f"⚠️ {e}", gr.skip(), gr.skip()
         return
 
     citations = _extract_citations(answer)
     if not citations:
         answer += _NO_CITATION_NOTE
-    yield answer, _format_citations_panel(citations)
+    answer += _KNESSET_DISCLAIMER_GROUNDED if n_found else _KNESSET_DISCLAIMER_UNGROUNDED
+
+    yield answer, _format_citations_panel(citations), _format_knesset_sources_panel(law_sources)
 
 
 # --- Canon AI (RAG over the Codice di Diritto Canonico, Italian) -----------
@@ -1745,6 +1782,155 @@ def hipaa_chat_fn(message, history):
     yield answer, _format_hipaa_sources_panel(sources)
 
 
+# --- Knesset law RAG (grounds the Attorney/DictaLM tab) -------------------
+#
+# Same shape as Canon AI/GDPR AI/HIPAA AI above, pointed at Israeli
+# primary legislation pulled from the Knesset's official OData API
+# (scripts/scrape_knesset_laws.py) and embedded by
+# scripts/embed_knesset_to_chroma.py. Reuses the generic
+# _embed_canon_query/_rerank_candidates/_tokenize helpers already defined
+# above rather than duplicating them.
+#
+# UNLIKE Canon/GDPR/HIPAA, this collection has NO exact-number lookup.
+# Canon numbers and GDPR/HIPAA article/section numbers are unique within
+# their single corpus; Israeli "סעיף 1" exists in hundreds of different
+# laws, so a bare section-number match can't disambiguate which law is
+# meant. Retrieval here is semantic+lexical hybrid rerank only -- see
+# scripts/embed_knesset_to_chroma.py's module docstring for the full
+# reasoning.
+#
+# Path/collection name MUST match what embed_knesset_to_chroma.py was run
+# with.
+KNESSET_CHROMA_DIR = str(Path(__file__).resolve().parent / "chroma_db")
+KNESSET_COLLECTION_NAME = "knesset_laws"
+
+_KNESSET_TOP_K = 6
+_KNESSET_FETCH_K = 20
+
+_knesset_collection_cache = None
+
+
+def _get_knesset_collection():
+    """Same lazy-connect-and-cache pattern as _get_canon_collection/
+    _get_gdpr_collection/_get_hipaa_collection -- returns None (not an
+    exception) if the DB hasn't been built yet, so the Attorney tab
+    degrades to DictaLM's own knowledge instead of breaking."""
+    global _knesset_collection_cache
+    if _knesset_collection_cache is not None:
+        return _knesset_collection_cache
+    if chromadb is None:
+        return None
+    try:
+        client = chromadb.PersistentClient(path=KNESSET_CHROMA_DIR)
+        _knesset_collection_cache = client.get_collection(KNESSET_COLLECTION_NAME)
+        return _knesset_collection_cache
+    except Exception as e:
+        import traceback
+        print(f"[Knesset RAG] failed to open Chroma collection at "
+              f"'{KNESSET_CHROMA_DIR}' / '{KNESSET_COLLECTION_NAME}': {e}")
+        traceback.print_exc()
+        return None
+
+
+def retrieve_knesset_laws(query: str, n_results: int = _KNESSET_TOP_K):
+    """
+    Retrieves relevant Israeli statute excerpts for a query via semantic
+    search (nomic-embed-text, through the shared _embed_canon_query
+    helper) over _KNESSET_FETCH_K candidates, then the shared hybrid
+    vector+lexical rerank + diversity filter, trimmed to n_results.
+
+    Returns (context_text, sources) -- or (None, None) on any failure
+    (missing DB, unreachable Ollama), which callers turn into "answer from
+    general knowledge, no grounding available" rather than a hard error --
+    unlike the Canon/GDPR/HIPAA tabs, the Attorney tab is expected to still
+    work (just less precisely) when this DB isn't present.
+    """
+    collection = _get_knesset_collection()
+    if collection is None:
+        return None, None
+
+    query_vector = _embed_canon_query(query)  # generic nomic-embed-text helper, reused as-is
+    if query_vector is None:
+        return None, None
+
+    try:
+        results = collection.query(
+            query_embeddings=[query_vector],
+            n_results=_KNESSET_FETCH_K,
+            include=["documents", "metadatas", "distances"],
+        )
+        raw_docs = (results.get("documents") or [[]])[0]
+        raw_metas = (results.get("metadatas") or [[]])[0]
+        raw_dists = (results.get("distances") or [[]])[0]
+        documents, metadatas = _rerank_candidates(query, raw_docs, raw_metas, raw_dists, top_n=n_results)
+    except Exception as e:
+        print(f"[Knesset RAG] query failed: {e}")
+        return None, None
+
+    if not documents:
+        return "", []
+
+    context_parts = []
+    sources = []
+    for doc, meta in zip(documents, metadatas):
+        title = meta.get("title", "")
+        section = meta.get("section_number", "")
+        url = meta.get("source_url", "")
+        label = f"[{title}" + (f", סעיף {section}" if section else "") + "]"
+        context_parts.append(f"{label}\n{doc}")
+        sources.append({"title": title, "section_number": section, "source_url": url})
+
+    context_text = "\n\n---\n\n".join(context_parts)
+    return context_text, sources
+
+
+def _format_knesset_sources_panel(sources: list[dict] | None) -> str:
+    if not sources:
+        return _KNESSET_SOURCES_NONE_FOUND
+    lines = []
+    for s in sources:
+        line = f"- **{s['title']}**"
+        if s.get("section_number"):
+            line += f" — סעיף {s['section_number']}"
+        if s.get("source_url"):
+            line += f"  \n  [{s['source_url']}]({s['source_url']})"
+        lines.append(line)
+    return "\n\n".join(lines)
+
+
+_KNESSET_SOURCES_PLACEHOLDER = (
+    "_No statutes retrieved yet. Once you ask a question, any Israeli "
+    "law excerpts retrieved from the Knesset legislation database will "
+    "be listed here._"
+)
+_KNESSET_SOURCES_NONE_FOUND = (
+    "_Nothing matched in the Knesset law database for this question -- "
+    "the answer relies on DictaLM's own knowledge only, not a retrieved "
+    "statute. Verify independently._"
+)
+
+# Appended to the end of EVERY Attorney-tab answer (not just shown once
+# above the chat like the tab's gr.Markdown description) -- so the
+# not-a-lawyer + Knesset-sourcing notice survives a copy-paste or
+# screenshot of just the answer text. Same placement pattern as the
+# existing _NO_CITATION_NOTE, and deliberately says something slightly
+# different depending on whether anything was actually retrieved for this
+# specific answer, rather than one generic disclaimer for every case.
+_KNESSET_DISCLAIMER_GROUNDED = (
+    "\n\n---\n⚖️ *This answer draws on statute excerpts retrieved from the "
+    "Knesset's official legislation database (see \"Statutes retrieved\" "
+    "in the sidebar). It is not legal advice and is not a substitute for "
+    "a licensed attorney -- verify anything consequential against the "
+    "actual legislation.*"
+)
+_KNESSET_DISCLAIMER_UNGROUNDED = (
+    "\n\n---\n⚖️ *No matching statute was retrieved from the Knesset "
+    "database for this question -- this answer relies on the model's own "
+    "general knowledge, not a verified source. It is not legal advice and "
+    "is not a substitute for a licensed attorney.*"
+)
+
+
 def set_hebrew_from_source_lang(source_lang):
     """
     Fires on the Translate tab's Source language dropdown. Hebrew/Tesseract
@@ -2203,33 +2389,38 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
     with gr.Tab("Attorney 24B"):
         gr.Markdown(
             "Chat with the local Hebrew-legal model "
-            "**Cutoff Date August 2025**. Attach a PDF, DOCX, "
-            "PPTX, or image and ask questions about it — text (with OCR if needed) "
-            "is extracted and given to the model as context.\n\n"
+            "**Cutoff Date August 2025**, grounded in Israeli statute text "
+            "retrieved from the Knesset's official legislation database "
+            "(RAG — Retrieval-Augmented Generation via ChromaDB + "
+            "nomic-embed-text). Attach a PDF, DOCX, PPTX, or image and ask "
+            "questions about it — text (with OCR if needed) is extracted "
+            "and given to the model as context.\n\n"
             "⚠️ This is not a substitute for advice from a licensed attorney. "
             "Citations to specific laws, sections, or cases should be independently "
             "verified — small local models can occasionally cite a law or section "
-            "that doesn't actually exist."
+            "that doesn't actually exist, and retrieval only covers what's been "
+            "embedded so far (see scripts/scrape_knesset_laws.py)."
         )
         legal_hebrew_checkbox = gr.Checkbox(
             label="Attached document is in Hebrew (uses Hebrew OCR instead of the default engine)"
         )
-        # Defined here (render=False) so it can be passed to ChatInterface's
-        # additional_outputs below, then actually placed in the right-hand
-        # column further down -- gr.ChatInterface requires additional_outputs
-        # to already exist in the same Blocks scope, but we want it to render
-        # in the sidebar, not wherever ChatInterface would put it by default.
+        # Defined here (render=False), same reasoning as before: gr.ChatInterface
+        # needs these to already exist in scope for additional_outputs, but we
+        # want them placed in the right-hand sidebar, not ChatInterface's default spot.
         legal_citations_panel = gr.Markdown(_CITATIONS_PLACEHOLDER, render=False)
+        legal_knesset_sources_panel = gr.Markdown(_KNESSET_SOURCES_PLACEHOLDER, render=False)
         with gr.Row():
             with gr.Column(scale=2):
                 gr.ChatInterface(
                     fn=legal_chat_fn, type="messages", multimodal=True,
                     additional_inputs=[legal_hebrew_checkbox],
-                    additional_outputs=[legal_citations_panel],
+                    additional_outputs=[legal_citations_panel, legal_knesset_sources_panel],
                 )
             with gr.Column(scale=1):
                 gr.Markdown("### 📚 Citations found")
                 legal_citations_panel.render()
+                gr.Markdown("### 🏛️ Statutes retrieved (Knesset DB)")
+                legal_knesset_sources_panel.render()
 
     with gr.Tab("Canon AI"):
         gr.Markdown(
