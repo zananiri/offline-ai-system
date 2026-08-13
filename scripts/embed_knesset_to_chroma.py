@@ -88,6 +88,23 @@ _MAX_CHUNK_CHARS = 2500
 # top-level sections are.
 _SECTION_SPLIT_RE = re.compile(r"^\s*(סעיף\s+(\d+[א-ת]?))", re.MULTILINE)
 
+# Approximates ui.py's _knesset_title_tokens/_KNESSET_WHOLE_LAW_MIN_TITLE_TOKENS
+# check (duplicated here, not imported -- see scripts/embed_local_law_pdfs.py's
+# module docstring for why small helpers are kept duplicated between these
+# two scripts). This script's title normally comes straight from the
+# Knesset API's own `name` field, which should always be a real law title
+# -- but a malformed/truncated API entry could in principle still produce
+# something too thin to ever be name-matched by ui.py's _detect_named_law,
+# and that failure mode is silent unless flagged (see
+# embed_local_law_pdfs.py's _guess_title docstring for the concrete case
+# that motivated adding this check there first).
+_TITLE_TOKEN_APPROX_RE = re.compile(r"[א-ת]+|[a-zA-Z]+|\d+")
+
+
+def _looks_like_a_thin_title(title: str, min_tokens: int = 3) -> bool:
+    tokens = {t for t in _TITLE_TOKEN_APPROX_RE.findall(title) if len(t) > 1}
+    return len(tokens) < min_tokens
+
 
 def _embed_text(text: str) -> list[float] | None:
     try:
@@ -200,6 +217,15 @@ def main():
         if not all_text_parts:
             print(f"[embed] LawID {law_id} ({entry.get('name')!r}): no extractable text, skipping.")
             continue
+
+        law_title = entry.get("name", "")
+        if _looks_like_a_thin_title(law_title):
+            print(f"[embed] LawID {law_id}: WARNING -- title {law_title!r} from the Knesset "
+                  f"API has fewer than 3 meaningful words. app/ui.py's whole-law detection "
+                  f"will NEVER match a question to this law by name; it'll only ever surface "
+                  f"via weak generic semantic search. Check the manifest entry for {law_id} "
+                  f"in {MANIFEST_PATH.name} -- this usually means the API returned a partial "
+                  f"or malformed 'name' field.")
 
         full_text = "\n\n".join(all_text_parts)
         sections = _split_into_sections(full_text)

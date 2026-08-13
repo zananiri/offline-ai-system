@@ -183,15 +183,89 @@ def _load_sidecar_metadata(pdf_path: Path) -> dict:
         return {}
 
 
+# Known masthead/boilerplate lines that appear on the first page of an
+# official Reshumot (Israeli government gazette) PDF -- these are NOT law
+# titles, but since they're typically the very first non-empty line on the
+# page, a naive "just take the first non-empty line" heuristic (the
+# previous version of _guess_title below) picks them up as the "title"
+# every single time. Confirmed in practice: a real government-published
+# law PDF produced title='רשומות' this way. That silently broke retrieval
+# downstream -- app/ui.py's _detect_named_law requires a title to tokenize
+# to at least _KNESSET_WHOLE_LAW_MIN_TITLE_TOKENS (3) meaningful words
+# before a law can ever be matched by name, and a single generic word can
+# never clear that bar. The law then never qualifies for the accurate
+# whole-law retrieval path, no matter how the question is phrased, and
+# silently falls back to weak generic semantic search across the entire
+# collection instead (visibly: the DictaLM tab's [Knesset RAG] log shows a
+# low best-candidate similarity, ~0.4-0.5, instead of a "Question names a
+# specific law" line).
+_MASTHEAD_LINES = {
+    "רשומות", "ילקוט הפרסומים", "ספר החוקים", "קובץ התקנות",
+    "המדינה", "מדינת ישראל", "State of Israel", "Reshumot",
+}
+
+# A real Israeli law title virtually always starts with one of these words
+# (חוק=Law, תקנות=Regulations, פקודת/פקודה=Ordinance, צו=Order,
+# חוזר=Circular). Actively preferring a line that matches this pattern --
+# rather than just taking whatever line happens to come first -- is what
+# lets this skip past masthead/boilerplate text sitting above the real
+# title on the page.
+_LAW_TITLE_START_RE = re.compile(r"^(חוק|תקנות|פקודת|פקודה|צו|חוזר)\b")
+
+# Approximates ui.py's _knesset_title_tokens/_KNESSET_WHOLE_LAW_MIN_TITLE_TOKENS
+# check (duplicated here rather than imported -- see this module's
+# docstring on why small helpers are kept duplicated between these two
+# scripts) so a still-too-thin guessed title is flagged loudly at embed
+# time instead of silently causing the exact same whole-law-detection
+# failure this fix is meant to close.
+_TITLE_TOKEN_APPROX_RE = re.compile(r"[א-ת]+|[a-zA-Z]+|\d+")
+
+
+def _looks_like_a_thin_title(title: str, min_tokens: int = 3) -> bool:
+    tokens = {t for t in _TITLE_TOKEN_APPROX_RE.findall(title) if len(t) > 1}
+    return len(tokens) < min_tokens
+
+
 def _guess_title(markdown_text: str, pdf_path: Path) -> str:
-    """No API metadata available for a manually-supplied PDF, so the title
-    is guessed from the document's own first non-empty line (Israeli law
-    PDFs conventionally open with the law's full name), falling back to
-    the filename if extraction produced nothing usable."""
-    for line in markdown_text.splitlines():
-        line = line.strip().lstrip("#").strip()
-        if line:
+    """
+    No API metadata available for a manually-supplied PDF, so the title is
+    guessed from the document's own text, in two passes over the first ~40
+    non-empty lines (title/masthead material is always near the top;
+    scanning the whole document risks accidentally picking up a later
+    סעיף's opening words instead of the actual title):
+
+      1. Prefer the first line that looks like an actual law title (starts
+         with חוק/תקנות/פקודת/צו/חוזר) -- virtually always correct when
+         present, since Israeli law documents are written in a very
+         predictable style.
+      2. Otherwise, fall back to the first line that ISN'T a known
+         masthead line and has at least 2 words -- a real title is never
+         a single token, which is exactly what let 'רשומות' slip through
+         before.
+
+    Falls back to the filename if nothing in the document looks usable at
+    all.
+
+    NOTE: if you already know the real title, just add a sidecar .json
+    with {"title": "..."} next to the PDF -- that always overrides this
+    guess entirely, so this function only matters when you don't.
+    """
+    lines = [ln.strip().lstrip("#").strip() for ln in markdown_text.splitlines()]
+    lines = [ln for ln in lines if ln][:40]
+
+    for line in lines:
+        if _LAW_TITLE_START_RE.match(line):
             return line[:200]
+
+    for line in lines:
+        if line in _MASTHEAD_LINES:
+            continue
+        if len(line.split()) < 2:
+            # A single token (a masthead word not in our known list yet, a
+            # lone page number, a lone date, etc.) is never a real title.
+            continue
+        return line[:200]
+
     return pdf_path.stem
 
 
@@ -268,6 +342,21 @@ def main():
 
         meta_overrides = _load_sidecar_metadata(pdf_path)
         title = meta_overrides.get("title") or _guess_title(markdown_text, pdf_path)
+        if _looks_like_a_thin_title(title):
+            # Covers BOTH a still-bad guess (e.g. a masthead phrase this
+            # script doesn't know about yet) AND a mistakenly thin
+            # hand-written sidecar title -- either way, app/ui.py's
+            # _detect_named_law will never be able to match a question to
+            # this law by name, and it'll only ever surface via weak
+            # generic semantic search. Printed as a loud warning (not
+            # silently accepted) since this exact failure mode already
+            # happened once with no visible signal until a user hit a
+            # timeout on the Attorney tab.
+            print(f"[embed]   WARNING: title {title!r} has fewer than 3 meaningful words -- "
+                  f"app/ui.py's whole-law detection will NEVER match a question to this law "
+                  f"by name, no matter how it's phrased. Strongly recommend adding/fixing "
+                  f"{pdf_path.with_suffix('.json').name} with the real title, e.g. "
+                  f'{{"title": "..."}} , then re-run with --force.')
         source_url = meta_overrides.get("source_url", "")
         sub_type = meta_overrides.get("sub_type", "manual upload")
         publication_date = meta_overrides.get("publication_date", "")
