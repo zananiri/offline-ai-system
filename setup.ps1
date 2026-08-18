@@ -130,6 +130,33 @@ ollama pull qwen2.5:7b-instruct-q4_K_M
 Write-Host "Pulling hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M (Legal tab model, ~14.3GB)..." -ForegroundColor Yellow
 ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
 
+# Attorney 24B tab's pipeline (app/legal_pipeline_v2.py -- see that module's
+# docstring for the full Dicta -> BGE-M3/BM25 -> DeepSeek -> Dicta ->
+# DeepSeek-verify architecture). Two new models, on top of DictaLM above:
+#   bge-m3        -- embedding model for the hybrid vector+BM25 retrieval.
+#                    MUST match the model scripts/embed_local_law_pdfs_bgem3.py
+#                    used to build the 'israeli_legal_db' collection -- mixing
+#                    embedding models between indexing and querying silently
+#                    breaks vector search (see that script's module docstring).
+#   deepseek-r1:32b -- the pipeline's reasoning + verification model
+#                    (DeepSeek-R1-Distill-Qwen-32B, ~19-20GB at Q4_K_M).
+#                    NOTE: this does NOT fit resident in RAM at the same time
+#                    as the 24B DictaLM model above on this project's target
+#                    32GB-RAM/no-GPU hardware -- OLLAMA_MAX_LOADED_MODELS=1
+#                    (see run.ps1) means Ollama swaps one out to load the
+#                    other, which is correct but adds real load-time latency
+#                    to every Dicta<->DeepSeek handoff in the pipeline, on
+#                    top of the multiple sequential calls each verification
+#                    cycle already makes. If that's too slow in practice,
+#                    edit DEEPSEEK_MODEL in app/legal_pipeline_v2.py down to
+#                    deepseek-r1:14b or deepseek-r1:7b instead.
+Write-Host "Pulling bge-m3 (embedding model for the Attorney 24B tab's hybrid retrieval)..." -ForegroundColor Yellow
+ollama pull bge-m3
+
+Write-Host "Pulling deepseek-r1:32b (DeepSeek-R1-Distill-Qwen-32B -- reasoning + verification" -ForegroundColor Yellow
+Write-Host "model for the Attorney 24B tab, ~19-20GB)..." -ForegroundColor Yellow
+ollama pull deepseek-r1:32b
+
 # ---------------------------------------------------------------------------
 # 5. Download + convert MADLAD-400 to CTranslate2 format (one-time, needs internet)
 # ---------------------------------------------------------------------------
@@ -140,15 +167,34 @@ python scripts\convert_translation_model.py
 # ---------------------------------------------------------------------------
 # 6. Build the Canon AI vector store (needs internet once, for chromadb + scraping)
 # ---------------------------------------------------------------------------
-Write-Host "Installing chromadb (not in requirements.txt's Ollama/torch pins -- kept" -ForegroundColor Yellow
-Write-Host "separate since it's only used by the Canon AI tab)..." -ForegroundColor Yellow
-pip install chromadb
+# rank_bm25 is installed alongside chromadb here (not in requirements.txt,
+# same reasoning as chromadb's own comment below) -- it's the keyword-search
+# half of the Attorney 24B tab's hybrid retrieval (app/legal_pipeline_v2.py),
+# a pure-Python package with no extra system dependency, so there's no real
+# cost to always installing it here rather than gating it behind a flag.
+Write-Host "Installing chromadb + rank_bm25 (not in requirements.txt's Ollama/torch pins -- kept" -ForegroundColor Yellow
+Write-Host "separate since they're only used by the RAG tabs)..." -ForegroundColor Yellow
+pip install chromadb rank_bm25
 
 Write-Host "Scraping CIC IT source content..." -ForegroundColor Yellow
 python scripts\scrape_cic_it.py
 
 Write-Host "Embedding into ChromaDB (app\chroma_db, collection 'cic_it')..." -ForegroundColor Yellow
 python scripts\embed_to_chroma.py
+
+# ---------------------------------------------------------------------------
+# 7. Build the Attorney 24B tab's legal vector store (BGE-M3 + hybrid retrieval)
+# ---------------------------------------------------------------------------
+# Safe to run even with an empty/nonexistent uploads/ folder -- the script
+# just creates it and prints a reminder to drop law PDFs in before re-running
+# (same graceful-empty-run behavior as scripts/embed_local_law_pdfs.py). Not
+# something this step can meaningfully verify succeeded beyond "it ran": the
+# real corpus depends on what law PDFs you actually have -- see that script's
+# own docstring for the uploads/ layout and optional sidecar-metadata format.
+Write-Host "Building the Attorney 24B tab's legal vector store (collection 'israeli_legal_db')..." -ForegroundColor Yellow
+Write-Host "(embeds any PDFs already in uploads\ with bge-m3 -- re-run this script anytime" -ForegroundColor DarkYellow
+Write-Host " after adding more law PDFs to uploads\)" -ForegroundColor DarkYellow
+python scripts\embed_local_law_pdfs_bgem3.py
 
 Write-Host ""
 Write-Host "=== Setup complete ===" -ForegroundColor Cyan

@@ -3,6 +3,8 @@ Gradio UI — talks to the FastAPI backend at localhost:8000.
 Run after main.py is already running: python -m app.ui
 """
 import base64
+import queue
+import threading
 import unicodedata
 import re
 import tempfile
@@ -22,6 +24,19 @@ except ImportError:
 
 from app.translate import LANGUAGES
 from app.document import chunk_text
+# DeepSeek-backed Attorney tabs' grounding pipeline (Attorney 32B / Attorney
+# 24B (DeepSeek 14B) -- BGE-M3 + BM25 hybrid retrieval ->
+# DeepSeek reasoning -> Dicta draft -> DeepSeek verification loop) -- see
+# that module's docstring for the full architecture. Imported under an
+# alias so its availability flag reads clearly against LEGAL_MODEL/etc.
+# below without colliding with the (unrelated) `chromadb` availability
+# flag already used for the Canon/GDPR/HIPAA/Knesset tabs above.
+from app.legal_pipeline_v2 import (
+    answer_legal_question,
+    PIPELINE_AVAILABLE as LEGAL_V2_AVAILABLE,
+    DEEPSEEK_MODEL_DEFAULT as LEGAL_V2_DEEPSEEK_32B,
+    DEEPSEEK_MODEL_FAST as LEGAL_V2_DEEPSEEK_14B,
+)
 
 BACKEND_URL = "http://localhost:8000"
 
@@ -888,12 +903,12 @@ def _legal_chat_fn_impl(
         reason = (retrieval_info or {}).get("reason")
         if reason == "embedding_unavailable":
             status = ("⚖️ *Couldn't reach the embedding model (nomic-embed-text via Ollama) "
-                       "to search the Knesset database — answering from DictaLM's own knowledge…*")
+                       "to search the Knesset database — answering from the Agent's own knowledge…*")
         elif reason == "chroma_unavailable":
             status = ("⚖️ *Couldn't open the Knesset vector database (ChromaDB) — "
-                       "answering from DictaLM's own knowledge…*")
+                       "answering from the Agent's own knowledge…*")
         else:
-            status = "⚖️ *Knesset database unavailable — answering from DictaLM's own knowledge…*"
+            status = "⚖️ *Knesset database unavailable — answering from the Agent's own knowledge…*"
     elif n_found:
         status = f"⚖️ *Found {n_found} relevant statute excerpt(s) — consulting AI…*"
     else:
@@ -949,15 +964,172 @@ def _legal_chat_fn_impl(
     yield answer, _format_citations_panel(citations), _format_knesset_sources_panel(law_sources, retrieval_info)
 
 
+def _format_legal_v2_sources_panel(sources: list[dict], verification: dict, cycles_used: int) -> str:
+    """Sidebar panel for the DeepSeek-backed Attorney tabs' new
+    pipeline -- distinct from _format_knesset_sources_panel (used by the
+    Fast tab's older pipeline) since this one also has verification
+    status/cycle count to show, and a per-source is_current/effective_from
+    flag from the richer metadata schema scripts/embed_local_law_pdfs_bgem3.py
+    writes."""
+    header = f"**Verification: {verification.get('status', '?')}** ({cycles_used} retrieval cycle(s) used)"
+    if verification.get("issues"):
+        header += "\n\n" + "\n".join(f"- ⚠️ {issue}" for issue in verification["issues"])
+    header += "\n\n---\n\n"
+
+    if not sources:
+        return header + _KNESSET_SOURCES_NONE_FOUND
+
+    lines = []
+    for s in sources:
+        line = f"- **{s.get('law_name', '')}**"
+        if s.get("section"):
+            line += f" — סעיף {s['section']}"
+            if s.get("subsection"):
+                line += f"({s['subsection']})"
+        if not s.get("is_current", True):
+            line += "  \n  🚨 *not currently marked in force*"
+        elif s.get("effective_from"):
+            line += f"  \n  תחילה: {s['effective_from']}"
+        if s.get("source_url"):
+            line += f"  \n  [{s['source_url']}]({s['source_url']})"
+        lines.append(line)
+    return header + "\n\n".join(lines)
+
+
+def _legal_chat_fn_v2_impl(message, history, hebrew_doc, *, deepseek_model: str, tab_label: str):
+    """
+    Shared generator behind BOTH DeepSeek-backed Attorney tabs (one
+    per DeepSeek size -- see legal_chat_fn / legal_chat_fn_deepseek14b
+    below). Every tab-specific choice is passed in explicitly (deepseek_model
+    for which Ollama tag runs the reasoning/verification stages, tab_label
+    only for the missing-deps message) rather than baked into one function,
+    so the two tabs can never silently drift out of sync with each other --
+    same reasoning app/ui.py already applies to _legal_chat_fn_impl (the
+    OLDER pipeline's shared implementation behind the 24B/1.7B split).
+
+    answer_legal_question() is synchronous and can genuinely take several
+    minutes (multiple sequential LLM calls, possibly repeated across retry
+    cycles, all on CPU) -- running it directly inside this generator would
+    leave the chat UI frozen with no feedback for the whole duration, which
+    is exactly the "looks hung" problem this project's other tabs already
+    guard against with intermediate status yields. Since
+    answer_legal_question reports progress via a plain callback rather than
+    being a generator itself, it's run in a background thread here, with
+    its on_progress() calls pushed onto a queue that this generator drains
+    and yields from as they arrive -- same end result (live progress in the
+    chat) as every other tab's yield-per-stage pattern, just bridged across
+    a thread boundary since the pipeline module has no Gradio/generator
+    dependency of its own (see that module's docstring for why).
+    """
+    if isinstance(message, dict):
+        user_text = message.get("text", "")
+        files = message.get("files", []) or []
+    else:
+        user_text = message
+        files = []
+
+    if not LEGAL_V2_AVAILABLE:
+        yield (
+            f"⚠️ The {tab_label} tab's pipeline (app/legal_pipeline_v2.py) isn't fully set up yet. "
+            "Make sure you've run:\n"
+            "- `pip install chromadb rank_bm25`\n"
+            "- `ollama pull bge-m3`\n"
+            f"- `ollama pull {deepseek_model}`\n"
+            "- `python scripts/embed_local_law_pdfs_bgem3.py` (builds the `israeli_legal_db` collection)\n\n"
+            "Until then, try the **Attorney 1.7B (Fast)** tab instead, which still uses the "
+            "original Knesset-RAG pipeline.",
+            gr.skip(), gr.skip(),
+        )
+        return
+
+    file_context = ""
+    if files:
+        yield "📄 *Extracting text from the attached file(s)…*", gr.skip(), gr.skip()
+        file_context = extract_context_from_files(files, hebrew=hebrew_doc)
+        if len(file_context) > MAX_CONTEXT_CHARS:
+            file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
+
+    clean_history = [
+        {"role": turn["role"], "content": turn["content"]}
+        for turn in history
+        if isinstance(turn.get("content"), str)
+    ]
+
+    progress_queue: queue.Queue = queue.Queue()
+    result_holder: dict = {}
+
+    def _run_pipeline():
+        try:
+            result_holder["result"] = answer_legal_question(
+                user_text, clean_history, file_context,
+                on_progress=lambda msg: progress_queue.put(("progress", msg)),
+                deepseek_model=deepseek_model,
+            )
+        except RuntimeError as e:
+            # Same contract as _chat_backend's RuntimeError elsewhere in
+            # this file -- a clean, user-facing message, not a raw traceback.
+            result_holder["error"] = str(e)
+        except Exception as e:  # noqa: BLE001 -- last-resort net so a bug in
+            # the pipeline surfaces as a chat message instead of a silently
+            # hung worker thread the generator below would wait on forever.
+            result_holder["error"] = f"Unexpected error in the legal pipeline: {e}"
+        finally:
+            progress_queue.put(("done", None))
+
+    worker = threading.Thread(target=_run_pipeline, daemon=True)
+    worker.start()
+
+    while True:
+        kind, payload = progress_queue.get()
+        if kind == "progress":
+            yield payload, gr.skip(), gr.skip()
+        else:
+            break
+    worker.join()
+
+    if "error" in result_holder:
+        yield f"⚠️ {result_holder['error']}", gr.skip(), gr.skip()
+        return
+
+    result = result_holder["result"]
+    citations = _extract_citations(result["answer"])
+    yield (
+        result["answer"],
+        _format_citations_panel(citations),
+        _format_legal_v2_sources_panel(result["sources"], result["verification"], result["cycles_used"]),
+    )
+
+
 def legal_chat_fn(message, history, hebrew_doc=False):
-    """Attorney 24B tab -- DictaLM-3.0-24B-Thinking. Stronger legal
-    reasoning, much slower on CPU-only hardware (see LEGAL_MODEL's comment
-    for why _LEGAL_NUM_CTX is capped at 11264 on 32GB/no-GPU machines)."""
-    yield from _legal_chat_fn_impl(
+    """Attorney 32B tab -- app/legal_pipeline_v2's pipeline (Dicta query
+    understanding -> BGE-M3 vector search + BM25 -> Reciprocal Rank Fusion
+    -> hybrid rerank -> DeepSeek legal reasoning -> Dicta Hebrew draft ->
+    DeepSeek verification, retrying up to MAX_VERIFICATION_CYCLES times on
+    FAIL), running DeepSeek-R1-Distill-Qwen-32B for the reasoning and
+    verification stages -- stronger legal reasoning, but does not fit in
+    RAM alongside DictaLM-3.0-24B-Thinking at the same time on this
+    project's target 32GB hardware (see DEEPSEEK_MODEL_DEFAULT's comment in
+    app/legal_pipeline_v2.py), so every Dicta<->DeepSeek handoff pays a
+    real model-load cost. If that's too slow, use **Attorney 24B (DeepSeek
+    14B)** instead."""
+    yield from _legal_chat_fn_v2_impl(
         message, history, hebrew_doc,
-        model=LEGAL_MODEL, num_predict=_LEGAL_NUM_PREDICT, num_ctx=_LEGAL_NUM_CTX,
-        request_timeout=_LEGAL_REQUEST_TIMEOUT_SECONDS,
-        whole_law_max_weight=_KNESSET_WHOLE_LAW_MAX_WEIGHT,
+        deepseek_model=LEGAL_V2_DEEPSEEK_32B, tab_label="Attorney 32B",
+    )
+
+
+def legal_chat_fn_deepseek14b(message, history, hebrew_doc=False):
+    """Attorney 24B (DeepSeek 14B) tab -- identical pipeline to legal_chat_fn
+    above, just with DeepSeek-R1-Distill-Qwen-14B (~9GB at Q4_K_M) running
+    the reasoning/verification stages instead of the 32B variant. That size
+    comfortably fits in memory alongside DictaLM-3.0-24B-Thinking on this
+    project's target 32GB-RAM/no-GPU hardware, so switching between the
+    Dicta and DeepSeek calls each pipeline stage makes doesn't force a
+    model reload every time -- meaningfully faster end-to-end, at some cost
+    to reasoning/verification depth versus the 32B tab."""
+    yield from _legal_chat_fn_v2_impl(
+        message, history, hebrew_doc,
+        deepseek_model=LEGAL_V2_DEEPSEEK_14B, tab_label="Attorney 24B (Offline AI 14B)",
     )
 
 
@@ -2761,7 +2933,7 @@ _KNESSET_SOURCES_PLACEHOLDER = (
 )
 _KNESSET_SOURCES_NONE_FOUND = (
     "_Nothing matched in the Knesset law database for this question -- "
-    "the answer relies on DictaLM's own knowledge only, not a retrieved "
+    "the answer relies on the Agent's own knowledge only, not a retrieved "
     "statute. Verify independently._"
 )
 
@@ -3223,6 +3395,7 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
         gr.ChatInterface(
             fn=chat_fn, type="messages", multimodal=True,
             additional_inputs=[chat_hebrew_checkbox],
+            chatbot=gr.Chatbot(type="messages", height=650),
         )
 
     with gr.Tab("Accountant"):
@@ -3257,24 +3430,27 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
             outputs=[report_out, summary_out],
         )
 
-    with gr.Tab("Attorney 24B"):
+    with gr.Tab("Attorney 32B"):
         gr.Markdown(
-            "Chat with the local Hebrew-legal model "
-            "**Cutoff Date August 2025**, grounded in Israeli statute text "
-            "retrieved from the Knesset's official legislation database "
-            "(RAG — Retrieval-Augmented Generation via ChromaDB + "
-            "nomic-embed-text). Attach a PDF, DOCX, PPTX, or image and ask "
-            "questions about it — text (with OCR if needed) is extracted "
-            "and given to the model as context.\n\n"
-            "🐢 Strongest legal reasoning of the two Attorney tabs, but slow "
-            "on CPU-only hardware -- a single answer can genuinely take tens "
-            "of minutes. If that's not workable for you, try **Attorney "
-            "1.7B (Fast)** instead.\n\n"
+            "Chat with a multi-model Israeli-legal pipeline: your question is "
+            "expanded into several search queries, retrieved via **hybrid "
+            "BGE-M3 vector search + BM25 keyword search** (fused with "
+            "Reciprocal Rank Fusion and reranked), analyzed by **Offline AI**, "
+            "drafted into Hebrew by **Agent**, then "
+            "**checked by Offline AI again** against the retrieved sources -- "
+            "retrying retrieval up to 3 times if that check fails. See the "
+            "sidebar for the sources used and the verification result. "
+            "Attach a PDF, DOCX, PPTX, or image and ask questions about it — "
+            "text (with OCR if needed) is extracted and given as context.\n\n"
+            "🐢 Several sequential LLM calls per question (more if a "
+            "verification retry fires), all on CPU -- a single answer can "
+            "genuinely take a while. If that's not workable for you, try "
+            "**Attorney 1.7B (Fast)** instead, which uses the simpler, "
+            "single-pass retrieval pipeline.\n\n"
             "⚠️ This is not a substitute for advice from a licensed attorney. "
-            "Citations to specific laws, sections, or cases should be independently "
-            "verified — small local models can occasionally cite a law or section "
-            "that doesn't actually exist, and retrieval only covers what's been "
-            "embedded so far (see scripts/scrape_knesset_laws.py)."
+            "Even with verification, citations to specific laws or sections "
+            "should be independently checked, and retrieval only covers what's "
+            "been embedded so far (see scripts/embed_local_law_pdfs_bgem3.py)."
         )
         legal_hebrew_checkbox = gr.Checkbox(
             label="Attached document is in Hebrew (uses Hebrew OCR instead of the default engine)"
@@ -3290,6 +3466,7 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                     fn=legal_chat_fn, type="messages", multimodal=True,
                     additional_inputs=[legal_hebrew_checkbox],
                     additional_outputs=[legal_citations_panel, legal_knesset_sources_panel],
+                    chatbot=gr.Chatbot(type="messages", height=650),
                 )
             with gr.Column(scale=1):
                 gr.Markdown("### 📚 Citations found")
@@ -3297,10 +3474,49 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                 gr.Markdown("### 🏛️ Statutes retrieved (Knesset DB)")
                 legal_knesset_sources_panel.render()
 
+    with gr.Tab("Attorney 24B (Offline AI 14B)"):
+        gr.Markdown(
+            "Same pipeline as the **Attorney 32B** tab -- hybrid BGE-M3 + "
+            "BM25 retrieval, Offline AI reasoning, Agent "
+            "Hebrew draft, Offline AI verification with retries -- but running "
+            "**a 14B reasoning model** for the reasoning/verification "
+            "steps instead of the 32B model.\n\n"
+            "⚡ The 14B model fits in memory alongside the 24B Agent "
+            "model on a 32GB-RAM machine, so this tab doesn't pay the "
+            "repeated model-reload cost the 32B tab does on every Agent<->"
+            "Offline AI handoff -- meaningfully faster end-to-end. Real "
+            "tradeoff: somewhat weaker legal reasoning and verification "
+            "than the 32B model. Use this as your default; use **Attorney "
+            "24B** (32B) when you specifically want the strongest reasoning "
+            "and can afford the extra time.\n\n"
+            "⚠️ This is not a substitute for advice from a licensed attorney. "
+            "Even with verification, citations to specific laws or sections "
+            "should be independently checked, and retrieval only covers what's "
+            "been embedded so far (see scripts/embed_local_law_pdfs_bgem3.py)."
+        )
+        legal_14b_hebrew_checkbox = gr.Checkbox(
+            label="Attached document is in Hebrew (uses Hebrew OCR instead of the default engine)"
+        )
+        legal_14b_citations_panel = gr.Markdown(_CITATIONS_PLACEHOLDER, render=False)
+        legal_14b_sources_panel = gr.Markdown(_KNESSET_SOURCES_PLACEHOLDER, render=False)
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.ChatInterface(
+                    fn=legal_chat_fn_deepseek14b, type="messages", multimodal=True,
+                    additional_inputs=[legal_14b_hebrew_checkbox],
+                    additional_outputs=[legal_14b_citations_panel, legal_14b_sources_panel],
+                    chatbot=gr.Chatbot(type="messages", height=650),
+                )
+            with gr.Column(scale=1):
+                gr.Markdown("### 📚 Citations found")
+                legal_14b_citations_panel.render()
+                gr.Markdown("### 🏛️ Statutes retrieved + verification")
+                legal_14b_sources_panel.render()
+
     with gr.Tab("Attorney 1.7B (Fast)"):
         gr.Markdown(
-            "Faster variant of the Attorney tab, using **DictaLM-3.0-1.7B-"
-            "Thinking** instead of the 24B model -- much quicker replies on "
+            "Faster variant of the Attorney tab, using a smaller **Agent** "
+            "model instead of the 24B model -- much quicker replies on "
             "CPU-only hardware, since the smaller model needs a fraction of "
             "the compute and RAM the 24B does. Same Knesset-grounded RAG "
             "retrieval and safety notices as the 24B tab.\n\n"
@@ -3309,7 +3525,7 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
             "⚡ Real tradeoff for the speed: this model is a meaningfully "
             "weaker legal reasoner than the 24B and **more prone to "
             "fabricating specific citations**. Use this for a quick rough "
-            "answer or to test something; use **Attorney 24B** for anything "
+            "answer or to test something; use **Attorney 32B** for anything "
             "you actually need to rely on.\n\n"
             "⚠️ This is not a substitute for advice from a licensed attorney. "
             "Citations to specific laws, sections, or cases should be independently "
@@ -3326,6 +3542,7 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                     fn=legal_chat_fn_fast, type="messages", multimodal=True,
                     additional_inputs=[legal_fast_hebrew_checkbox],
                     additional_outputs=[legal_fast_citations_panel, legal_fast_knesset_sources_panel],
+                    chatbot=gr.Chatbot(type="messages", height=650),
                 )
             with gr.Column(scale=1):
                 gr.Markdown("### 📚 Citations found")
@@ -3350,6 +3567,7 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                 gr.ChatInterface(
                     fn=canon_chat_fn, type="messages",
                     additional_outputs=[canon_sources_panel],
+                    chatbot=gr.Chatbot(type="messages", height=650),
                 )
             with gr.Column(scale=1):
                 gr.Markdown("### 📖 Canons retrieved")
@@ -3372,6 +3590,7 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                 gr.ChatInterface(
                     fn=gdpr_chat_fn, type="messages",
                     additional_outputs=[gdpr_sources_panel],
+                    chatbot=gr.Chatbot(type="messages", height=650),
                 )
             with gr.Column(scale=1):
                 gr.Markdown("### 📜 Articles retrieved")
@@ -3397,6 +3616,7 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                 gr.ChatInterface(
                     fn=hipaa_chat_fn, type="messages",
                     additional_outputs=[hipaa_sources_panel],
+                    chatbot=gr.Chatbot(type="messages", height=650),
                 )
             with gr.Column(scale=1):
                 gr.Markdown("### 🏥 Sections retrieved")
