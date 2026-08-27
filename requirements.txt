@@ -3,7 +3,6 @@
 # Tier 1: version-critical (breaking changes are common) — pinned exact
 docling[rapidocr]==2.113.0
 docling-core==2.86.0
-ctranslate2==4.8.1
 ollama==0.6.2
 # NOTE on the Legal tab's model: app/ui.py's LEGAL_MODEL was upgraded from
 # DictaLM-3.0-1.7B-Thinking to the 24B-Thinking flagship (Q4_K_M, ~14.3GB)
@@ -13,15 +12,6 @@ ollama==0.6.2
 # smaller IQ4_XS fallback if you're tight on RAM) and needs no pip package
 # changes at all: the ollama pin above is unaffected, since the Python
 # client just talks to whatever model name it's given.
-
-# Tier 2: used once, offline, for the MADLAD-400 conversion step only
-# (kept loose on purpose — these are never imported at runtime by the app,
-# only by scripts/convert_translation_model.py — pinning them tightly just to
-# throw them away after conversion isn't worth the maintenance cost)
-transformers>=4.46,<5.0
-sentencepiece==0.2.0
-huggingface_hub>=0.27,<1.0
-hf_xet             # faster Hugging Face downloads (chunked transfer); without it, large model downloads can be very slow
 
 # Tier 3: stable orchestration layer — floor pins, resolved exactly by setup.ps1
 fastapi>=0.115,<1.0

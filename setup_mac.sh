@@ -38,7 +38,7 @@ TOTAL_RAM_GB=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
 info "Total system RAM: ${TOTAL_RAM_GB}GB (setup.ps1's original target was 32GB)."
 
 # ---------------------------------------------------------------------------
-# 1. Python 3.11 (Docling/ctranslate2 wheels are built and tested against 3.11)
+# 1. Python 3.11 (Docling wheels are built and tested against 3.11)
 # ---------------------------------------------------------------------------
 if ! brew list python@3.11 >/dev/null 2>&1; then
     info "Installing Python 3.11..."
@@ -112,12 +112,14 @@ fi
 info "Pulling gpt-oss:20b (~13GB)..."
 ollama pull gpt-oss:20b
 
-# Backs ONLY the Translate tab's optional summarizer step (app/main.py's
-# TRANSLATE_SUMMARY_MODEL / app/ui.py's TRANSLATE_SUMMARY_MODEL) -- kept as
-# a separate, smaller pull since qwen2.5's multilingual output is more
-# reliable than gpt-oss:20b's for non-English summaries.
-info "Pulling qwen2.5:7b-instruct-q4_K_M (~4.7GB)..."
-ollama pull qwen2.5:7b-instruct-q4_K_M
+# qwen2.5:32b backs the Chat tab (chat, document rewrite, and the two-step
+# LLM document-translation flow -- see app/ui.py's CHAT_MODEL/
+# TRANSLATE_MODEL and translate_document_via_llm). This replaces the old
+# dedicated Translate tab's offline MADLAD-400/CTranslate2 pipeline, which
+# has been removed entirely -- translation is now just a chat request like
+# any other ("translate this to French"), not a separate model/tab.
+info "Pulling qwen2.5:32b (Chat tab: chat, document rewrite, and document translation)..."
+ollama pull qwen2.5:32b
 
 # Matches the LEGAL_MODEL constant currently in app/main.py and app/ui.py --
 # Dicta's 24B flagship, Q4_K_M quant, ~14.3GB download. On an Intel Mac (no
@@ -129,14 +131,7 @@ info "Pulling hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M (Legal tab mod
 ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
 
 # ---------------------------------------------------------------------------
-# 5. Download + convert MADLAD-400 to CTranslate2 format (one-time, needs internet)
-# ---------------------------------------------------------------------------
-info "Converting MADLAD-400-3B to CTranslate2 format..."
-echo "(this downloads several GB from Hugging Face once, then quantizes to int8)"
-python scripts/convert_translation_model.py
-
-# ---------------------------------------------------------------------------
-# 6. Build the Canon AI vector store (needs internet once, for chromadb + scraping)
+# 5. Build the Canon AI vector store (needs internet once, for chromadb + scraping)
 # ---------------------------------------------------------------------------
 info "Installing chromadb (not in requirements.txt's Ollama/torch pins -- kept"
 info "separate since it's only used by the Canon AI tab)..."

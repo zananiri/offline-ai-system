@@ -22,36 +22,127 @@ try:
 except ImportError:
     chromadb = None  # Canon AI tab degrades to a clear error message if this isn't installed
 
-from app.translate import LANGUAGES
 from app.document import chunk_text
-# DeepSeek-backed Attorney tabs' grounding pipeline (Attorney 32B / Attorney
-# 24B (DeepSeek 14B) -- BGE-M3 + BM25 hybrid retrieval ->
-# DeepSeek reasoning -> Dicta draft -> DeepSeek verification loop) -- see
-# that module's docstring for the full architecture. Imported under an
+# DictaLM-only Attorney tab's grounding pipeline (BGE-M3 + BM25 hybrid
+# retrieval -> Dicta answers directly from retrieved sources -> independent
+# Dicta verification pass + a deterministic citation-existence check) --
+# see that module's docstring for the full architecture. Imported under an
 # alias so its availability flag reads clearly against LEGAL_MODEL/etc.
 # below without colliding with the (unrelated) `chromadb` availability
 # flag already used for the Canon/GDPR/HIPAA/Knesset tabs above.
 from app.legal_pipeline_v2 import (
     answer_legal_question,
+    answer_legal_question_instruct,
     PIPELINE_AVAILABLE as LEGAL_V2_AVAILABLE,
-    DEEPSEEK_MODEL_DEFAULT as LEGAL_V2_DEEPSEEK_32B,
-    DEEPSEEK_MODEL_FAST as LEGAL_V2_DEEPSEEK_14B,
 )
 
 BACKEND_URL = "http://localhost:8000"
 
-# Backs ONLY the Translate tab's optional "Also summarize with AI" step
-# (see process() below). NOTE: this string is duplicated in app/main.py's
-# TRANSLATE_SUMMARY_MODEL (same reasoning as LEGAL_MODEL's duplication --
-# ui.py only talks to the backend over HTTP and can't share a Python
-# constant with it) -- keep the two in sync if you change the model.
-# Deliberately kept separate from the backend's general OLLAMA_MODEL
-# default (gpt-oss:20b, used by Chat/Canon AI/invoice classification):
-# qwen2.5-instruct is explicitly trained for strong multilingual output
-# across this app's translation targets, where gpt-oss:20b is more prone
-# to drifting back into English despite the "Respond ONLY in {target_lang}"
-# instruction below -- see main.py's TRANSLATE_SUMMARY_MODEL comment.
-TRANSLATE_SUMMARY_MODEL = "qwen2.5:7b-instruct-q4_K_M"
+# The Chat tab's dedicated model -- was implicitly inheriting the backend's
+# general OLLAMA_MODEL default (gpt-oss:20b, still used elsewhere: invoice
+# classification, PowerPoint outline generation). qwen2.5:32b is used
+# explicitly here (and by the document-translation flow below, which is
+# also chat-tab-initiated) instead, since it's a stronger multilingual
+# generator than gpt-oss:20b -- gpt-oss:20b is primarily English-optimized
+# and more prone to drifting back into English on non-English output.
+CHAT_MODEL = "qwen2.5:32b"
+
+# --- LLM-based document translation (Chat tab) ------------------------------
+#
+# Replaces the old dedicated Translate tab (app/translate.py's MADLAD-400/
+# CTranslate2 pipeline, removed) -- translation is now just another thing
+# you can ask the Chat tab to do with an attached document, via two
+# sequential qwen2.5:32b calls per chunk:
+#
+#   Job 1 (cleaning): fixes OCR/PDF-extraction line breaks and typos
+#       WITHOUT translating -- raw OCR text fed straight into a
+#       translation prompt tends to produce visibly worse output right
+#       around sentence boundaries that got split mid-word, so this runs
+#       first as its own dedicated pass.
+#   Job 2 (translation): translates the CLEANED text into whatever
+#       language the user actually asked for. The target language is
+#       deliberately NOT parsed out by this code at all -- the user's own
+#       request text is hard-coded into the prompt as-is, and the model is
+#       responsible for identifying and honoring the target language. That's
+#       far more robust than a brittle language-name regex would be across
+#       Hebrew/English/other scripts and phrasings ("to French", "לצרפתית",
+#       "in formal German", etc.), and it's also why there's no LANGUAGES
+#       dict or source/target dropdown left in this app at all anymore --
+#       free-form chat request text replaces that fixed list entirely.
+TRANSLATE_MODEL = CHAT_MODEL
+
+_TRANSLATE_CLEAN_SYSTEM_PROMPT = (
+    "You are a document cleaning assistant specializing in preparing OCR and extracted PDF text for processing.\n"
+    "YOUR TASK:\n"
+    "Fix line breaks, join broken sentences, and repair minor OCR formatting errors in the provided source text.\n"
+    "STRICT RULES:\n"
+    "1. Do NOT translate the text. Keep it strictly in its ORIGINAL source language.\n"
+    "2. Unwrap line breaks that split sentences midway, while preserving intentional structural paragraph breaks.\n"
+    "3. Repair obvious OCR typos or broken punctuation.\n"
+    "4. Do NOT alter facts, names, numbers, email addresses, or core meaning.\n"
+    "5. Do NOT summarize or shorten any section.\n"
+    "6. Output ONLY the cleaned user provided text. Do NOT add any preamble, intro, explanations, or commentary."
+)
+
+_TRANSLATE_JOB2_SYSTEM_PROMPT = (
+    "You are an expert bilingual editor and professional translator specializing in publication-grade "
+    "target language requested by the user.\n"
+    "YOUR TASK:\n"
+    "Translate the provided clean source text into formal, fluent, publication-ready user requested "
+    "target language text.\n"
+    "STRICT RULES:\n"
+    "1. Maintain strict grammatical correctness, including proper noun genders.\n"
+    "2. Translate geographical and political entities accurately.\n"
+    "3. Preserve all entity formatting, numbers, proper nouns, and contact details.\n"
+    "4. Do NOT output any system commentary, chatter, preambles, or concluding remarks.\n"
+    "5. Output ONLY the final translated target language text."
+)
+
+# Paragraph-sized, matching the same reasoning _REWRITE_CHUNK_CHARS below
+# already uses for long-document LLM processing in this file: enough
+# context per chunk for the model to clean/translate coherently, small
+# enough that num_predict comfortably covers the output without the model
+# needing to compress to fit.
+_TRANSLATE_CHUNK_CHARS = 3000
+_TRANSLATE_NUM_PREDICT_PER_CHUNK = 1600
+
+
+def translate_document_via_llm(file_context: str, user_request: str) -> str:
+    """
+    Two-step LLM translation over a (potentially long) attached document,
+    processed in paragraph-sized chunks and reassembled -- mirrors
+    rewrite_document_professionally's existing chunk-then-process pattern
+    below for the same reason: a whole multi-page document in one call
+    risks the model compressing/summarizing to fit rather than reproducing
+    everything.
+
+    Each chunk goes through BOTH jobs before moving to the next chunk
+    (clean chunk 1 -> translate chunk 1 -> clean chunk 2 -> ...), not all
+    of job 1 across every chunk followed by all of job 2 -- keeps memory
+    flat and means a failure partway through still has fully-finished
+    chunks in translated_parts rather than a half-done intermediate pass
+    over the whole document.
+    """
+    chunks = chunk_text(file_context, max_chars=_TRANSLATE_CHUNK_CHARS)
+    translated_parts = []
+    for chunk in chunks:
+        cleaned = _chat_backend(
+            [
+                {"role": "system", "content": _TRANSLATE_CLEAN_SYSTEM_PROMPT},
+                {"role": "user", "content": chunk},
+            ],
+            model=TRANSLATE_MODEL, num_predict=_TRANSLATE_NUM_PREDICT_PER_CHUNK,
+        )
+        translated = _chat_backend(
+            [
+                {"role": "system", "content": _TRANSLATE_JOB2_SYSTEM_PROMPT},
+                {"role": "user", "content": f"User's request: {user_request}\n\nSource text:\n{cleaned}"},
+            ],
+            model=TRANSLATE_MODEL, num_predict=_TRANSLATE_NUM_PREDICT_PER_CHUNK,
+        )
+        translated_parts.append(translated)
+    return "\n\n".join(translated_parts)
+
 
 # Matches (and pads slightly past) main.py's own _OLLAMA_REQUEST_TIMEOUT_SECONDS,
 # so this client never gives up before the backend's own safety-net timeout
@@ -63,20 +154,24 @@ TRANSLATE_SUMMARY_MODEL = "qwen2.5:7b-instruct-q4_K_M"
 _CHAT_TIMEOUT_SECONDS = 1830
 
 
-def _chat_backend(messages, model=None, num_predict=None, num_ctx=None, timeout=None, timeout_hint=None):
+def _chat_backend(messages, model=None, num_predict=None, num_ctx=None, timeout=_CHAT_TIMEOUT_SECONDS, timeout_hint=None):
     """
     POSTs to the backend's /chat endpoint and returns the response content
     as a plain string. Raises RuntimeError with a clean, user-facing message
     on any failure (backend unreachable, timed out, or a clean error detail
     the backend itself already generated) -- callers decide what to do with
     that: show it as the reply (chat_fn/legal_chat_fn), or fall back
-    gracefully without losing other already-successful work (process()'s
-    summarizer step, where a failed summary shouldn't also take down the
-    translated text that already succeeded).
+    gracefully without losing other already-successful work (e.g. a failed
+    rewrite/translate sub-step for one chunk shouldn't necessarily take
+    down chunks that already succeeded).
 
     timeout/timeout_hint let a caller override the default for a model that
-    needs more room (see legal_chat_fn, which passes a larger timeout and a
-    more specific hint tailored to a "thinking" model on a broad question).
+    needs more room (see legal_chat_fn_fast, which passes timeout=None for
+    DictaLM -- no client-side timeout at all, not just a bigger one). The
+    default lives in the parameter itself (not resolved with `... or
+    _CHAT_TIMEOUT_SECONDS` inside the body) specifically so an explicit
+    timeout=None from a caller means "no timeout", not "fall back to the
+    default" -- `or` can't tell those two cases apart, since None is falsy.
 
     num_ctx lets a caller request a bigger context window than the backend's
     own default -- see main.py's _num_ctx_for comment for why this matters:
@@ -92,7 +187,6 @@ def _chat_backend(messages, model=None, num_predict=None, num_ctx=None, timeout=
         payload["num_predict"] = num_predict
     if num_ctx:
         payload["num_ctx"] = num_ctx
-    timeout = timeout or _CHAT_TIMEOUT_SECONDS
     try:
         resp = requests.post(f"{BACKEND_URL}/chat", json=payload, timeout=timeout)
     except requests.exceptions.Timeout:
@@ -124,7 +218,7 @@ def _chat_backend(messages, model=None, num_predict=None, num_ctx=None, timeout=
 # stronger legal reasoning and more reliable citations. Q4_K_M quantization
 # is a ~14.3GB download/on-disk file. On a 32GB-RAM, offline/CPU (or
 # modest-iGPU) machine this fits with room to spare for the OS and the rest
-# of this app's own memory use (docling, the MADLAD-400 translation model,
+# of this app's own memory use (docling, the qwen2.5:32b Chat-tab model,
 # etc.) -- but it's the biggest single thing this app loads, so:
 #   - Real tradeoff vs. the 1.7B: much slower generation (CPU tok/s roughly
 #     tracks parameter count, so expect noticeably fewer tokens/sec than the
@@ -210,16 +304,22 @@ LEGAL_MODEL_FAST = "hf.co/dicta-il/DictaLM-3.0-1.7B-Thinking-GGUF:Q4_K_M"
 # app already uses for the 24B tab, and adjust if your hardware disagrees.
 _LEGAL_FAST_NUM_PREDICT = 4096
 _LEGAL_FAST_NUM_CTX = 24576
-# Raised 900 -> 1800 (30 min): 15 min turned out too tight in practice --
-# a real request hit this timeout with no evidence in the FastAPI/Gradio
-# console of anything actually stuck (retrieval/rerank completed normally
-# right before it), meaning the 1.7B model itself was just still generating
-# when the clock ran out, not hung. Still kept well under the 24B tab's
-# 3700s and the backend's own 3600s safety net (main.py's
-# _OLLAMA_REQUEST_TIMEOUT_SECONDS), so a genuinely stuck request still
-# fails well before an hour, just with more realistic headroom for normal
-# slow-hardware generation than 900s gave it.
-_LEGAL_FAST_REQUEST_TIMEOUT_SECONDS = 1800
+# No client-side timeout at all (was 1800s/30min, raised from an original
+# 900s) -- DictaLM-3.0-1.7B-Thinking's generation time on CPU varies a lot
+# with question complexity, and a real request already hit the 30-minute
+# version of this cap with no evidence in the FastAPI/Gradio console of
+# anything actually stuck (retrieval/rerank completed normally right
+# before it) -- meaning the model was just still generating when the clock
+# ran out, not hung. Rather than keep guessing at a bigger-but-still-finite
+# number, this now waits as long as DictaLM actually takes. See
+# _chat_backend's docstring for why timeout=None here isn't silently
+# overridden back to the default. NOTE: this only removes the CLIENT-side
+# (ui.py) timeout -- main.py's backend still enforces its own
+# _OLLAMA_REQUEST_TIMEOUT_SECONDS (3600s/60min) on the underlying Ollama
+# call, since this tab is routed through the backend's /chat endpoint
+# rather than talking to Ollama directly. Raise/remove that too if a
+# genuinely stuck-free unlimited wait is needed end-to-end.
+_LEGAL_FAST_REQUEST_TIMEOUT_SECONDS = None
 
 # Whole-law budget for the fast tab -- see _KNESSET_WHOLE_LAW_MAX_WEIGHT's
 # comment for the full reasoning behind how this number is derived
@@ -323,231 +423,6 @@ def _format_citations_panel(citations: list[str]) -> str:
         return _CITATIONS_NONE_FOUND
     return "\n\n".join(f"- {c}" for c in citations)
 
-# Languages whose script reads right-to-left. Used to flip the translated-text
-# output box's text direction so Arabic/Hebrew results display correctly
-# instead of being left-aligned like Latin-script languages.
-RTL_LANGUAGES = {"arabic", "hebrew"}
-
-
-def _is_rtl(lang: str) -> bool:
-    return (lang or "").strip().lower() in RTL_LANGUAGES
-
-
-_RTL_MARK = "\u200f"  # RIGHT-TO-LEFT MARK (invisible, sets bidi direction only)
-
-
-def _anchor_rtl_lines(text: str) -> str:
-    """
-    Textbox(rtl=True) sets the box's overall base direction, but that alone
-    doesn't stop individual lines from getting visually reordered by the
-    browser's bidi algorithm -- a line that happens to start with a digit,
-    punctuation, or an embedded Latin word/number (invoice numbers, dates,
-    stray English terms) can pull that whole line's layout toward
-    left-to-right, scattering words out of their intended order.
-
-    Prefixing every non-empty line with an invisible RIGHT-TO-LEFT MARK
-    (U+200F) fixes each line's base direction as RTL regardless of its
-    first character, without adding any visible content.
-    """
-    if not text:
-        return text
-    return "\n".join(
-        f"{_RTL_MARK}{line}" if line.strip() else line
-        for line in text.split("\n")
-    )
-
-
-# --- Document preview (Translate tab's right-hand panel) -------------------
-#
-# There's no single Gradio component that previews every format this app
-# accepts, so three different strategies are used depending on file type:
-#
-#   Images  -> gr.Image with show_fullscreen_button=True. Gives a native
-#              click-to-zoom/pan lightbox for free (same mechanism this
-#              file already uses for the header logo, just switched on).
-#   PDFs    -> embedded via a base64 data: URI inside an <iframe>, so the
-#              browser's own PDF viewer renders it -- built-in zoom, scroll,
-#              page navigation, and print, no extra dependency. A data URI
-#              is used instead of a path-based Gradio static-file URL (e.g.
-#              "/file=...") on purpose: that route's exact prefix differs
-#              across Gradio major versions and only works for paths inside
-#              Gradio's allowed-paths, which is fragile to hardcode. A data
-#              URI works identically regardless of Gradio version.
-#   Other   -> (DOCX, PPTX, etc.) no in-browser renderer exists for these
-#              without extra dependencies, so the existing /extract-text
-#              endpoint is reused to show the extracted text instead. Not a
-#              visual preview, but it directly shows what's about to be
-#              translated, and costs nothing extra: DOCX/PPTX never go
-#              through OCR (see document.py), so this second extraction
-#              call is fast.
-_PREVIEW_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
-
-# Above this, base64-inlining the whole file into the page's HTML would
-# bloat the page enough to feel sluggish -- fall back to a plain notice
-# instead of a broken/slow preview. Translation itself is unaffected either
-# way; this only gates the preview panel.
-_MAX_INLINE_PREVIEW_BYTES = 20 * 1024 * 1024  # 20 MB
-
-
-def _pdf_preview_html(path: Path) -> str:
-    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    data_uri = f"data:application/pdf;base64,{b64}"
-    return f"""
-<div style="border:1px solid var(--border-color-primary, #ddd); border-radius:8px; overflow:hidden;">
-  <iframe src="{data_uri}" style="width:100%; height:520px; border:none;"></iframe>
-</div>
-<p style="text-align:center; margin-top:6px;">
-  <a href="{data_uri}" target="_blank" rel="noopener">🔍 Open full preview in a new tab (zoom, scroll, print)</a>
-</p>
-"""
-
-
-def build_preview(file):
-    """
-    Builds a live preview of the uploaded document for the panel on the
-    right of the Translate tab. Wired to file_in.change, so it fires the
-    moment a file is picked (or cleared) -- independent of clicking
-    Translate -- letting the user confirm it's the right document before
-    running anything.
-
-    The whole preview column is hidden by default and only made visible
-    once a file is actually present, and hidden again when the file is
-    cleared -- there's no "upload a document" placeholder state, the panel
-    simply isn't there until there's something to show.
-
-    Returns a 4-tuple of gr.update(...) for (preview_column, image_preview,
-    pdf_preview_html, text_preview). Within the column, exactly one of the
-    three preview components is made visible at a time (text_preview also
-    doubles as the spot for status/error messages, e.g. an oversized PDF
-    or a failed extraction).
-    """
-    hidden = gr.update(visible=False)
-
-    if file is None:
-        return gr.update(visible=False), hidden, hidden, hidden
-
-    path = Path(file.name)
-    suffix = path.suffix.lower()
-
-    if suffix in _PREVIEW_IMAGE_EXTS:
-        return gr.update(visible=True), gr.update(value=str(path), visible=True), hidden, hidden
-
-    if suffix == ".pdf":
-        size = path.stat().st_size
-        if size > _MAX_INLINE_PREVIEW_BYTES:
-            msg = (
-                f"⚠️ This PDF is {size / 1_048_576:.1f} MB, too large to preview inline. "
-                "It will still be translated normally -- the preview panel just skips it."
-            )
-            return gr.update(visible=True), hidden, hidden, gr.update(value=msg, visible=True)
-        return gr.update(visible=True), hidden, gr.update(value=_pdf_preview_html(path), visible=True), hidden
-
-    # DOCX/PPTX/etc. -- no visual renderer available, fall back to extracted text.
-    try:
-        with open(path, "rb") as f:
-            resp = requests.post(f"{BACKEND_URL}/extract-text", files={"file": f}, data={"hebrew": False})
-        resp.raise_for_status()
-        text = resp.json().get("markdown", "")
-    except Exception as e:
-        return gr.update(visible=True), hidden, hidden, gr.update(value=f"⚠️ Couldn't build a preview: {e}", visible=True)
-
-    if not text.strip():
-        return gr.update(visible=True), hidden, hidden, gr.update(value="(no previewable text found in this document)", visible=True)
-    return gr.update(visible=True), hidden, hidden, gr.update(value=text, visible=True)
-
-
-def process(file, source_lang, target_lang, summarize, hebrew_doc, progress=gr.Progress()):
-    progress(0, desc="Extracting text from document (OCR if needed)...")
-    with open(file.name, "rb") as f:
-        extract_resp = requests.post(
-            f"{BACKEND_URL}/extract-text", files={"file": f}, data={"hebrew": hebrew_doc}
-        )
-    extract_resp.raise_for_status()
-    extract_data = extract_resp.json()
-    markdown_text = extract_data["markdown"]
-    # The backend can auto-detect Hebrew and route through Tesseract even
-    # if hebrew_doc was False (see document.py's resolve_hebrew_flag) --
-    # report what actually ran, not just what was requested, so this
-    # doesn't silently lie when that override kicks in.
-    hebrew_used = extract_data.get("hebrew_used", hebrew_doc)
-    ocr_engine = "Tesseract (Hebrew)" if hebrew_used else "RapidOCR (default)"
-
-    chunks = chunk_text(markdown_text)
-    if not chunks:
-        return (
-            gr.update(value="(no text found in document)", rtl=_is_rtl(target_lang)),
-            ocr_engine,
-            "(not requested)",
-        )
-
-    total_steps = len(chunks) + (1 if summarize else 0)
-    translated_chunks = []
-    failed_chunks = 0
-    for i, chunk in enumerate(chunks):
-        progress((i + 1) / total_steps, desc=f"Translating chunk {i + 1}/{len(chunks)}...")
-        resp = requests.post(
-            f"{BACKEND_URL}/translate-chunk",
-            json={"text": chunk, "source_lang": source_lang, "target_lang": target_lang},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        translated_value = data.get("translated", "")
-        ok = data.get("ok", True)
-        if not isinstance(translated_value, str):
-            # Defensive: a backend/frontend version mismatch (e.g. main.py
-            # not unpacking the (text, ok) tuple translate() now returns)
-            # would otherwise land a list/tuple here and crash the whole
-            # request at the join() below. Degrade to a visible failure
-            # instead of a hard crash.
-            translated_value = str(translated_value)
-            ok = False
-        if ok:
-            translated_chunks.append(translated_value)
-        else:
-            failed_chunks += 1
-            translated_chunks.append(
-                f">>> COULD NOT TRANSLATE THIS SECTION (shown untranslated below) >>>\n"
-                f"{translated_value}\n"
-                f"<<< END UNTRANSLATED SECTION <<<"
-            )
-
-    translated_text = "\n\n".join(translated_chunks)
-    if failed_chunks:
-        translated_text = (
-            f"⚠️ {failed_chunks} of {len(chunks)} section(s) could not be translated and are shown "
-            f"in their ORIGINAL, untranslated form below (marked with >>> / <<<). This almost always "
-            f"means the extracted text for those sections was garbled — usually poor OCR quality on "
-            f"a scanned page, rather than a translation problem. Check the OCR engine used below, and "
-            f"whether the source document/scan quality is high enough.\n\n"
-        ) + translated_text
-
-    summary = "(not requested)"
-    if summarize:
-        progress(1.0, desc="Summarizing with AI...")
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"You are a precise document summarizer. Respond ONLY in "
-                    f"{target_lang}, matching the language of the text you are "
-                    f"given -- never switch to a different language."
-                ),
-            },
-            {"role": "user", "content": f"Summarize this in 3-5 bullet points:\n\n{translated_text}"},
-        ]
-        try:
-            summary = _chat_backend(messages, model=TRANSLATE_SUMMARY_MODEL)
-        except RuntimeError as e:
-            summary = f"⚠️ Summary failed: {e}"
-
-    is_rtl = _is_rtl(target_lang)
-    display_text = _anchor_rtl_lines(translated_text) if is_rtl else translated_text
-    display_summary = (
-        gr.update(value=_anchor_rtl_lines(summary), rtl=True) if (is_rtl and summarize)
-        else gr.update(value=summary, rtl=False)
-    )
-    return gr.update(value=display_text, rtl=is_rtl), ocr_engine, display_summary
-
 
 def convert_to_word(file, hebrew_doc, progress=gr.Progress()):
     progress(0.15, desc="Extracting text (running OCR if needed)...")
@@ -621,7 +496,25 @@ def _is_rewrite_request(text: str) -> bool:
     return bool(_REWRITE_TRIGGER_RE.search(text or ""))
 
 
-# Paragraph-sized, not sentence-sized like translate.py's chunk_text(max_chars=400)
+# Matches a request to translate an attached document, e.g. "translate this
+# to Spanish", "can you translate it into French", "תרגם את המסמך לעברית".
+# When this fires on a message with an attached file, chat_fn routes to
+# translate_document_via_llm() instead of the normal single-shot chat call.
+# Deliberately just a verb trigger, not a language-name regex -- see
+# translate_document_via_llm's docstring for why the target language is
+# left entirely to the model to identify from the request text itself.
+_TRANSLATE_TRIGGER_RE = re.compile(
+    r"\b(translate|translation)\b|תרגם|תרגמי|תרגום",
+    re.IGNORECASE,
+)
+
+
+def _is_translate_request(text: str) -> bool:
+    return bool(_TRANSLATE_TRIGGER_RE.search(text or ""))
+
+
+# Paragraph-sized, not sentence-sized like document.py's chunk_text()'s own
+# default (max_chars=400, tuned for short-sentence MT-style reliability)
 # -- a rewrite call needs enough surrounding context per chunk to produce
 # coherent, professional prose, but still small enough that num_predict
 # below comfortably covers the rewritten output without the model needing
@@ -650,12 +543,12 @@ def rewrite_document_professionally(file_context: str) -> str:
     """
     Rewrites a (potentially long) attached document into professional
     English while preserving all information, by processing it in
-    paragraph-sized chunks and reassembling the results -- mirroring the
-    per-chunk approach translate.py already uses for the same reason: a
-    single call on a whole multi-page document runs into the model's
-    num_predict/num_ctx ceiling and starts compressing/summarizing instead
-    of reproducing everything, which is exactly the "13 pages -> 1-2 page
-    table" failure this was written to fix.
+    paragraph-sized chunks and reassembling the results: a single call on
+    a whole multi-page document runs into the model's num_predict/num_ctx
+    ceiling and starts compressing/summarizing instead of reproducing
+    everything, which is exactly the "13 pages -> 1-2 page table" failure
+    this was written to fix. translate_document_via_llm above uses the
+    same chunk-then-process pattern for the same reason.
     """
     chunks = chunk_text(file_context, max_chars=_REWRITE_CHUNK_CHARS)
     rewritten_parts = []
@@ -665,7 +558,7 @@ def rewrite_document_professionally(file_context: str) -> str:
             {"role": "user", "content": chunk},
         ]
         rewritten_parts.append(
-            _chat_backend(messages, num_predict=_REWRITE_NUM_PREDICT_PER_CHUNK)
+            _chat_backend(messages, model=CHAT_MODEL, num_predict=_REWRITE_NUM_PREDICT_PER_CHUNK)
         )
     return "\n\n".join(rewritten_parts)
 
@@ -696,23 +589,33 @@ def chat_fn(message, history, hebrew_doc=False):
         files = []
 
     is_rewrite = _is_rewrite_request(user_text)
+    is_translate = _is_translate_request(user_text)
 
     file_context = ""
     if files:
         yield "📄 *Extracting text from the attached file(s)…*"
         file_context = extract_context_from_files(files, hebrew=hebrew_doc)
-        # A rewrite request needs the WHOLE document, not a 6000-char
-        # preview -- truncating here was the main reason a 13-page document
-        # only ever came back as 1-2 pages: everything past ~6000 chars
-        # never even reached the model. Only truncate for normal Q&A-style
-        # attachments, where a preview is a reasonable tradeoff.
-        if not is_rewrite and len(file_context) > MAX_CONTEXT_CHARS:
+        # A rewrite or translate request needs the WHOLE document, not a
+        # 6000-char preview -- truncating here was the main reason a
+        # 13-page document only ever came back as 1-2 pages: everything
+        # past ~6000 chars never even reached the model. Only truncate for
+        # normal Q&A-style attachments, where a preview is a reasonable
+        # tradeoff.
+        if not is_rewrite and not is_translate and len(file_context) > MAX_CONTEXT_CHARS:
             file_context = file_context[:MAX_CONTEXT_CHARS] + "\n[...truncated, file is longer...]"
 
     if is_rewrite and file_context:
         yield "✍️ *Rewriting the document in professional English (this can take a while for long documents)…*"
         try:
             yield rewrite_document_professionally(file_context)
+        except RuntimeError as e:
+            yield f"⚠️ {e}"
+        return
+
+    if is_translate and file_context:
+        yield "🌐 *Cleaning and translating the document (this can take a while for long documents)…*"
+        try:
+            yield translate_document_via_llm(file_context, user_text)
         except RuntimeError as e:
             yield f"⚠️ {e}"
         return
@@ -759,7 +662,7 @@ def chat_fn(message, history, hebrew_doc=False):
     messages = clean_history + [{"role": "user", "content": combined_message}]
     yield "🤖 *Thinking…*"
     try:
-        yield _chat_backend(messages)
+        yield _chat_backend(messages, model=CHAT_MODEL)
     except RuntimeError as e:
         yield f"⚠️ {e}"
 
@@ -800,21 +703,25 @@ def _annotate_legal_answer(answer: str, n_found: int) -> tuple[str, list[str]]:
 
 def _legal_chat_fn_impl(
     message, history, hebrew_doc,
-    *, model: str, num_predict: int, num_ctx: int, request_timeout: int,
+    *, model: str, num_predict: int, num_ctx: int, request_timeout: int | None,
     whole_law_max_weight: float,
 ):
     """
-    Shared implementation behind both Attorney tabs (24B and 1.7B) --
-    RAG-grounded on Israeli statute text retrieved from the Knesset
-    OData-sourced ChromaDB collection (see retrieve_knesset_laws above --
-    either the whole text of a specifically-named law, or a top-K semantic
-    search, depending on the question; see that function's docstring).
+    Implementation behind the Attorney 1.7B (Fast) tab -- RAG-grounded on
+    Israeli statute text retrieved from the Knesset OData-sourced ChromaDB
+    collection (see retrieve_knesset_laws above -- either the whole text of
+    a specifically-named law, or a top-K semantic search, depending on the
+    question; see that function's docstring). The other Attorney tabs
+    (Attorney 32B / Attorney 32B Instruct (Slower)) run a different
+    pipeline entirely -- see app/legal_pipeline_v2.py.
 
-    Every tab-specific model/context/timeout/budget setting is passed in
-    explicitly rather than read from a single shared constant, so the two
-    tabs can genuinely run different-sized models with correctly-sized
-    context windows at the same time -- see legal_chat_fn / legal_chat_fn_fast
-    below for the concrete numbers each tab uses.
+    Every setting (model/context/timeout/budget) is passed in explicitly
+    rather than read from a module-level constant, kept from when this was
+    genuinely shared between two tabs -- left this way since there's no
+    real cost to it and it documents each value's origin clearly at the
+    call site (see legal_chat_fn_fast below for the concrete numbers).
+    request_timeout may be None (no client-side timeout at all) -- see
+    _chat_backend's docstring for how that's threaded through correctly.
 
     Returns (answer, citations_panel_markdown, knesset_sources_panel_markdown)
     -- three outputs via ChatInterface's additional_outputs: the existing
@@ -996,30 +903,36 @@ def _format_legal_v2_sources_panel(sources: list[dict], verification: dict, cycl
     return header + "\n\n".join(lines)
 
 
-def _legal_chat_fn_v2_impl(message, history, hebrew_doc, *, deepseek_model: str, tab_label: str):
+def _run_legal_pipeline_v2(pipeline_fn, missing_deps_label, message, history, hebrew_doc=False):
     """
-    Shared generator behind BOTH DeepSeek-backed Attorney tabs (one
-    per DeepSeek size -- see legal_chat_fn / legal_chat_fn_deepseek14b
-    below). Every tab-specific choice is passed in explicitly (deepseek_model
-    for which Ollama tag runs the reasoning/verification stages, tab_label
-    only for the missing-deps message) rather than baked into one function,
-    so the two tabs can never silently drift out of sync with each other --
-    same reasoning app/ui.py already applies to _legal_chat_fn_impl (the
-    OLDER pipeline's shared implementation behind the 24B/1.7B split).
+    Shared generator bridging a synchronous, callback-based
+    app.legal_pipeline_v2 answer function into a Gradio ChatInterface
+    generator. Used by BOTH Attorney tabs below -- they now run genuinely
+    different pipelines (answer_legal_question vs.
+    answer_legal_question_instruct), not just a different model choice on
+    the same pipeline, but the Gradio-facing plumbing (extract attached
+    files, run the synchronous call off-thread, drain its progress
+    callback, format the result into the citations/sources side panels) is
+    identical either way, so it's factored out once instead of duplicated.
 
-    answer_legal_question() is synchronous and can genuinely take several
-    minutes (multiple sequential LLM calls, possibly repeated across retry
-    cycles, all on CPU) -- running it directly inside this generator would
-    leave the chat UI frozen with no feedback for the whole duration, which
-    is exactly the "looks hung" problem this project's other tabs already
-    guard against with intermediate status yields. Since
-    answer_legal_question reports progress via a plain callback rather than
-    being a generator itself, it's run in a background thread here, with
-    its on_progress() calls pushed onto a queue that this generator drains
-    and yields from as they arrive -- same end result (live progress in the
-    chat) as every other tab's yield-per-stage pattern, just bridged across
-    a thread boundary since the pipeline module has no Gradio/generator
-    dependency of its own (see that module's docstring for why).
+    pipeline_fn is called as pipeline_fn(user_text, clean_history,
+    file_context, on_progress=...) and must return the same
+    {"answer", "sources", "cycles_used", "verification"} shape both
+    answer_legal_question and answer_legal_question_instruct share.
+
+    The pipeline call is synchronous and can genuinely take a while
+    (multiple sequential LLM calls, all on CPU) -- running it directly
+    inside this generator would leave the chat UI frozen with no feedback
+    for the whole duration, which is exactly the "looks hung" problem this
+    project's other tabs already guard against with intermediate status
+    yields. Since the pipeline reports progress via a plain callback rather
+    than being a generator itself, it's run in a background thread here,
+    with its on_progress() calls pushed onto a queue that this generator
+    drains and yields from as they arrive -- same end result (live
+    progress in the chat) as every other tab's yield-per-stage pattern,
+    just bridged across a thread boundary since the pipeline module has no
+    Gradio/generator dependency of its own (see that module's docstring
+    for why).
     """
     if isinstance(message, dict):
         user_text = message.get("text", "")
@@ -1030,11 +943,10 @@ def _legal_chat_fn_v2_impl(message, history, hebrew_doc, *, deepseek_model: str,
 
     if not LEGAL_V2_AVAILABLE:
         yield (
-            f"⚠️ The {tab_label} tab's pipeline (app/legal_pipeline_v2.py) isn't fully set up yet. "
+            f"⚠️ The {missing_deps_label} tab's pipeline (app/legal_pipeline_v2.py) isn't fully set up yet. "
             "Make sure you've run:\n"
             "- `pip install chromadb rank_bm25`\n"
             "- `ollama pull bge-m3`\n"
-            f"- `ollama pull {deepseek_model}`\n"
             "- `python scripts/embed_local_law_pdfs_bgem3.py` (builds the `israeli_legal_db` collection)\n\n"
             "Until then, try the **Attorney 1.7B (Fast)** tab instead, which still uses the "
             "original Knesset-RAG pipeline.",
@@ -1060,10 +972,9 @@ def _legal_chat_fn_v2_impl(message, history, hebrew_doc, *, deepseek_model: str,
 
     def _run_pipeline():
         try:
-            result_holder["result"] = answer_legal_question(
+            result_holder["result"] = pipeline_fn(
                 user_text, clean_history, file_context,
                 on_progress=lambda msg: progress_queue.put(("progress", msg)),
-                deepseek_model=deepseek_model,
             )
         except RuntimeError as e:
             # Same contract as _chat_backend's RuntimeError elsewhere in
@@ -1101,36 +1012,32 @@ def _legal_chat_fn_v2_impl(message, history, hebrew_doc, *, deepseek_model: str,
 
 
 def legal_chat_fn(message, history, hebrew_doc=False):
-    """Attorney 32B tab -- app/legal_pipeline_v2's pipeline (Dicta query
-    understanding -> BGE-M3 vector search + BM25 -> Reciprocal Rank Fusion
-    -> hybrid rerank -> DeepSeek legal reasoning -> Dicta Hebrew draft ->
-    DeepSeek verification, retrying up to MAX_VERIFICATION_CYCLES times on
-    FAIL), running DeepSeek-R1-Distill-Qwen-32B for the reasoning and
-    verification stages -- stronger legal reasoning, but does not fit in
-    RAM alongside DictaLM-3.0-24B-Thinking at the same time on this
-    project's target 32GB hardware (see DEEPSEEK_MODEL_DEFAULT's comment in
-    app/legal_pipeline_v2.py), so every Dicta<->DeepSeek handoff pays a
-    real model-load cost. If that's too slow, use **Attorney 24B (DeepSeek
-    14B)** instead."""
-    yield from _legal_chat_fn_v2_impl(
-        message, history, hebrew_doc,
-        deepseek_model=LEGAL_V2_DEEPSEEK_32B, tab_label="Attorney 32B",
-    )
+    """Attorney 32B tab -- app/legal_pipeline_v2's answer_legal_question():
+    Dicta query understanding -> BGE-M3 + BM25 hybrid retrieval (with a
+    named-law fast path that fetches an entire law directly, bypassing
+    top-K competition, when the question confidently names it) -> Dicta
+    answers directly from the retrieved sources (or says plainly that
+    they aren't relevant) -> an independent Dicta verification pass,
+    backed by a deterministic non-LLM check that every cited section
+    actually exists among what was retrieved -- retrying retrieval up to
+    MAX_VERIFICATION_CYCLES times on FAIL. Higher recall, less predictable
+    latency than **Attorney 32B Instruct (Slower)**'s single linear pass."""
+    yield from _run_legal_pipeline_v2(answer_legal_question, "Attorney 32B", message, history, hebrew_doc)
 
 
-def legal_chat_fn_deepseek14b(message, history, hebrew_doc=False):
-    """Attorney 24B (DeepSeek 14B) tab -- identical pipeline to legal_chat_fn
-    above, just with DeepSeek-R1-Distill-Qwen-14B (~9GB at Q4_K_M) running
-    the reasoning/verification stages instead of the 32B variant. That size
-    comfortably fits in memory alongside DictaLM-3.0-24B-Thinking on this
-    project's target 32GB-RAM/no-GPU hardware, so switching between the
-    Dicta and DeepSeek calls each pipeline stage makes doesn't force a
-    model reload every time -- meaningfully faster end-to-end, at some cost
-    to reasoning/verification depth versus the 32B tab."""
-    yield from _legal_chat_fn_v2_impl(
-        message, history, hebrew_doc,
-        deepseek_model=LEGAL_V2_DEEPSEEK_14B, tab_label="Attorney 24B (Offline AI 14B)",
-    )
+def legal_chat_fn_instruct(message, history, hebrew_doc=False):
+    """Attorney 32B Instruct (Slower) tab -- app/legal_pipeline_v2's
+    answer_legal_question_instruct(): a single linear pass (Dicta generates
+    JSON search terms -> ChromaDB hybrid vector/BM25 retrieval -> Dicta
+    reasons in <think> and answers with citations from the retrieved
+    sources -> a programmatic, non-LLM regex check validating every
+    citation against the retrieved sources' own metadata), with no retry
+    loop and no second LLM verification call. See that function's
+    docstring for the full architecture -- "Instruct" describes how the
+    search-term step is prompted, not a different model: both Attorney
+    tabs run the same DictaLM-3.0-24B-Thinking."""
+    yield from _run_legal_pipeline_v2(answer_legal_question_instruct, "Attorney 32B Instruct (Slower)",
+                                       message, history, hebrew_doc)
 
 
 def legal_chat_fn_fast(message, history, hebrew_doc=False):
@@ -2676,7 +2583,7 @@ def _batch_sections(sections: list[tuple[str, dict]], max_weight: float) -> list
 def _answer_whole_law_chunked(
     user_text: str, title: str, sections: list[tuple[str, dict]],
     clean_history: list[dict], file_context: str,
-    *, model: str, num_predict: int, num_ctx: int, request_timeout: int,
+    *, model: str, num_predict: int, num_ctx: int, request_timeout: int | None,
     reduce_max_weight: float,
 ):
     """
@@ -2972,27 +2879,6 @@ _KNESSET_DISCLAIMER_UNGROUNDED_WITH_CITATIONS = (
     "until you check it against the actual legislation. This is not legal advice "
     "and is not a substitute for a licensed attorney.*"
 )
-
-
-def set_hebrew_from_source_lang(source_lang):
-    """
-    Fires on the Translate tab's Source language dropdown. Hebrew/Tesseract
-    routing is now fully automatic — there's no checkbox for the user to
-    manage. Returns (is_hebrew, status_markdown_update).
-
-    NOTE: assumes the LANGUAGES dict in app/translate.py uses the key
-    "hebrew" (matching the lowercase convention "english"/"spanish" already
-    used as defaults below) — double check that key against translate.py if
-    this doesn't trigger correctly.
-    """
-    is_hebrew = (source_lang or "").strip().lower() == "hebrew"
-    if is_hebrew:
-        return True, gr.update(
-            value="🔤 **Hebrew selected — Tesseract OCR will be used automatically** "
-                  "(the only engine here with Hebrew support).",
-            visible=True,
-        )
-    return False, gr.update(value="", visible=False)
 
 
 LOGO_PATH = "app/assets/logo_t.png"  # transparent logo — put your logo file here, any size, it's auto-resized below
@@ -3318,54 +3204,6 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
         """
     )
 
-    with gr.Tab("Translate"):
-        with gr.Row():
-            with gr.Column(scale=3):
-                file_in = gr.File(label="Upload document (PDF, DOCX, PPTX, image)")
-                with gr.Row():
-                    src = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Source language", value="english")
-                    tgt = gr.Dropdown(choices=list(LANGUAGES.keys()), label="Target language", value="spanish")
-                    summarize = gr.Checkbox(label="Also summarize with AI")
-                hebrew_doc_translate = gr.State(value=False)
-                hebrew_status_translate = gr.Markdown(value="", visible=False)
-                src.change(
-                    set_hebrew_from_source_lang,
-                    inputs=[src],
-                    outputs=[hebrew_doc_translate, hebrew_status_translate],
-                )
-                run_btn = gr.Button("Translate")
-                output_text = gr.Textbox(
-                    label="Translated text", lines=20, rtl=_is_rtl(tgt.value), show_copy_button=True,
-                )
-                tgt.change(
-                    lambda target_lang: gr.update(rtl=_is_rtl(target_lang)),
-                    inputs=[tgt],
-                    outputs=[output_text],
-                )
-                ocr_engine_out = gr.Textbox(label="OCR engine (used if the document needed OCR)", interactive=False)
-                output_summary = gr.Textbox(label="Summary (if requested)", lines=5)
-                run_btn.click(
-                    process,
-                    inputs=[file_in, src, tgt, summarize, hebrew_doc_translate],
-                    outputs=[output_text, ocr_engine_out, output_summary],
-                )
-
-            with gr.Column(scale=2, visible=False) as preview_column:
-                gr.Markdown("### Document preview")
-                preview_image = gr.Image(
-                    label="Preview", visible=False, interactive=False,
-                    show_fullscreen_button=True, height=520,
-                )
-                preview_pdf_html = gr.HTML(visible=False)
-                preview_text = gr.Textbox(
-                    label="Preview", visible=False, lines=20, interactive=False,
-                )
-                file_in.change(
-                    build_preview,
-                    inputs=[file_in],
-                    outputs=[preview_column, preview_image, preview_pdf_html, preview_text],
-                )
-
     with gr.Tab("Convert to Word"):
         gr.Markdown("Upload a PDF (native or scanned) or an image — text is extracted "
                     "(with OCR if needed) and exported as a .docx file.")
@@ -3388,7 +3226,14 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                     "and given to the model as context.\n\n"
                     "💡 Ask it to **\"make/create/generate a PowerPoint (presentation/slide "
                     "deck) about ...\"** and it will build a downloadable .pptx file — attach "
-                    "a document first if you want the slides based on that document.")
+                    "a document first if you want the slides based on that document.\n\n"
+                    "🌐 Attach a document and ask it to **\"translate this to [language]\"** "
+                    "and it will clean up the extracted text and translate the whole document "
+                    "(processed in chunks for long documents) — say whatever language you want "
+                    "in plain language, there's no fixed list to choose from.\n\n"
+                    "✍️ Ask it to **\"rewrite this professionally\"** to turn an attached "
+                    "document into polished, professional English while preserving every "
+                    "fact and detail.")
         chat_hebrew_checkbox = gr.Checkbox(
             label="Attached document is in Hebrew (uses Hebrew OCR instead of the default engine)"
         )
@@ -3430,27 +3275,33 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
             outputs=[report_out, summary_out],
         )
 
-    with gr.Tab("Attorney 32B"):
+    with gr.Tab("Attorney 32B Instruct (Slower)"):
         gr.Markdown(
-            "Chat with a multi-model Israeli-legal pipeline: your question is "
-            "expanded into several search queries, retrieved via **hybrid "
+            "A single, linear pass over Israeli law, grounded in **hybrid "
             "BGE-M3 vector search + BM25 keyword search** (fused with "
-            "Reciprocal Rank Fusion and reranked), analyzed by **Offline AI**, "
-            "drafted into Hebrew by **Agent**, then "
-            "**checked by Offline AI again** against the retrieved sources -- "
-            "retrying retrieval up to 3 times if that check fails. See the "
-            "sidebar for the sources used and the verification result. "
-            "Attach a PDF, DOCX, PPTX, or image and ask questions about it — "
-            "text (with OCR if needed) is extracted and given as context.\n\n"
-            "🐢 Several sequential LLM calls per question (more if a "
-            "verification retry fires), all on CPU -- a single answer can "
-            "genuinely take a while. If that's not workable for you, try "
-            "**Attorney 1.7B (Fast)** instead, which uses the simpler, "
-            "single-pass retrieval pipeline.\n\n"
+            "Reciprocal Rank Fusion and reranked): Dicta generates JSON "
+            "search terms, ChromaDB retrieves the matching statute "
+            "excerpts (fetching a law's full text directly when the "
+            "question clearly names it, instead of competing for search "
+            "slots), Dicta reasons through the sources and drafts a cited "
+            "answer, and a programmatic (non-LLM) check confirms every "
+            "cited section actually exists among what was retrieved. "
+            "Attach a PDF, DOCX, PPTX, or image and ask questions about "
+            "it — text (with OCR if needed) is extracted and given as "
+            "context.\n\n"
+            "🐢 No shortcuts taken on any single step -- the model works "
+            "through full Hebrew legal reasoning before answering, so one "
+            "question can still take a while even without any retries. "
+            "There is no automatic retry loop: if the citation check finds "
+            "a problem, it's flagged clearly rather than triggering another "
+            "search. If you'd rather the system keep searching until an "
+            "answer verifies, use **Attorney 32B** instead.\n\n"
             "⚠️ This is not a substitute for advice from a licensed attorney. "
-            "Even with verification, citations to specific laws or sections "
-            "should be independently checked, and retrieval only covers what's "
-            "been embedded so far (see scripts/embed_local_law_pdfs_bgem3.py)."
+            "Citations are checked programmatically against what was "
+            "retrieved, not against the actual legislation -- verify "
+            "anything consequential yourself, and note that retrieval only "
+            "covers what's been embedded so far (see "
+            "scripts/embed_local_law_pdfs_bgem3.py)."
         )
         legal_hebrew_checkbox = gr.Checkbox(
             label="Attached document is in Hebrew (uses Hebrew OCR instead of the default engine)"
@@ -3463,7 +3314,7 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
         with gr.Row():
             with gr.Column(scale=2):
                 gr.ChatInterface(
-                    fn=legal_chat_fn, type="messages", multimodal=True,
+                    fn=legal_chat_fn_instruct, type="messages", multimodal=True,
                     additional_inputs=[legal_hebrew_checkbox],
                     additional_outputs=[legal_citations_panel, legal_knesset_sources_panel],
                     chatbot=gr.Chatbot(type="messages", height=650),
@@ -3474,44 +3325,48 @@ with gr.Blocks(title="AI Server", theme=CLARA_THEME, css=CLARA_CSS) as demo:
                 gr.Markdown("### 🏛️ Statutes retrieved (Knesset DB)")
                 legal_knesset_sources_panel.render()
 
-    with gr.Tab("Attorney 24B (Offline AI 14B)"):
+    with gr.Tab("Attorney 32B"):
         gr.Markdown(
-            "Same pipeline as the **Attorney 32B** tab -- hybrid BGE-M3 + "
-            "BM25 retrieval, Offline AI reasoning, Agent "
-            "Hebrew draft, Offline AI verification with retries -- but running "
-            "**a 14B reasoning model** for the reasoning/verification "
-            "steps instead of the 32B model.\n\n"
-            "⚡ The 14B model fits in memory alongside the 24B Agent "
-            "model on a 32GB-RAM machine, so this tab doesn't pay the "
-            "repeated model-reload cost the 32B tab does on every Agent<->"
-            "Offline AI handoff -- meaningfully faster end-to-end. Real "
-            "tradeoff: somewhat weaker legal reasoning and verification "
-            "than the 32B model. Use this as your default; use **Attorney "
-            "24B** (32B) when you specifically want the strongest reasoning "
-            "and can afford the extra time.\n\n"
+            "Chat with an Israeli-legal pipeline grounded in **hybrid "
+            "BGE-M3 vector search + BM25 keyword search** (fused with "
+            "Reciprocal Rank Fusion and reranked): your question is "
+            "expanded into several search queries, the retrieved sources "
+            "are answered directly by Dicta, then independently checked "
+            "by a second Dicta pass plus a programmatic (non-LLM) check "
+            "that every citation actually exists in what was retrieved -- "
+            "retrying retrieval up to 3 times if that check fails. See the "
+            "sidebar for the sources used and the verification result. "
+            "Attach a PDF, DOCX, PPTX, or image and ask questions about it — "
+            "text (with OCR if needed) is extracted and given as context.\n\n"
+            "🐢 Several sequential LLM calls per question (more if a "
+            "verification retry fires), all on CPU -- a single answer can "
+            "genuinely take a while, though the retry loop means it also "
+            "keeps trying rather than giving up after one pass. If you'd "
+            "rather have a single bounded-latency pass with no retries, "
+            "use **Attorney 32B Instruct (Slower)** instead.\n\n"
             "⚠️ This is not a substitute for advice from a licensed attorney. "
             "Even with verification, citations to specific laws or sections "
             "should be independently checked, and retrieval only covers what's "
             "been embedded so far (see scripts/embed_local_law_pdfs_bgem3.py)."
         )
-        legal_14b_hebrew_checkbox = gr.Checkbox(
+        legal_32b_hebrew_checkbox = gr.Checkbox(
             label="Attached document is in Hebrew (uses Hebrew OCR instead of the default engine)"
         )
-        legal_14b_citations_panel = gr.Markdown(_CITATIONS_PLACEHOLDER, render=False)
-        legal_14b_sources_panel = gr.Markdown(_KNESSET_SOURCES_PLACEHOLDER, render=False)
+        legal_32b_citations_panel = gr.Markdown(_CITATIONS_PLACEHOLDER, render=False)
+        legal_32b_sources_panel = gr.Markdown(_KNESSET_SOURCES_PLACEHOLDER, render=False)
         with gr.Row():
             with gr.Column(scale=2):
                 gr.ChatInterface(
-                    fn=legal_chat_fn_deepseek14b, type="messages", multimodal=True,
-                    additional_inputs=[legal_14b_hebrew_checkbox],
-                    additional_outputs=[legal_14b_citations_panel, legal_14b_sources_panel],
+                    fn=legal_chat_fn, type="messages", multimodal=True,
+                    additional_inputs=[legal_32b_hebrew_checkbox],
+                    additional_outputs=[legal_32b_citations_panel, legal_32b_sources_panel],
                     chatbot=gr.Chatbot(type="messages", height=650),
                 )
             with gr.Column(scale=1):
                 gr.Markdown("### 📚 Citations found")
-                legal_14b_citations_panel.render()
+                legal_32b_citations_panel.render()
                 gr.Markdown("### 🏛️ Statutes retrieved + verification")
-                legal_14b_sources_panel.render()
+                legal_32b_sources_panel.render()
 
     with gr.Tab("Attorney 1.7B (Fast)"):
         gr.Markdown(

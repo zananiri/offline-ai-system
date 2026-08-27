@@ -17,20 +17,21 @@ powershellollama serve
 New tab:
 powershell.\.venv\Scripts\Activate.ps1
 ollama pull gpt-oss:20b
-ollama pull qwen2.5:7b-instruct-q4_K_M
-(qwen2.5 backs ONLY the Translate tab's optional summarizer step -- see
-TRANSLATE_SUMMARY_MODEL in app/main.py and app/ui.py.)
+ollama pull qwen2.5:32b
+(qwen2.5:32b backs the Chat tab -- chat, document rewrite, and the two-step
+LLM document-translation flow. See CHAT_MODEL / TRANSLATE_MODEL in app/ui.py.
+This replaced the old dedicated Translate tab's offline MADLAD-400 pipeline,
+which has been removed entirely -- translation is now just a chat request
+like any other, not a separate model/tab.)
 ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
 (Legal tab model, ~14.3GB download -- must match LEGAL_MODEL in app/main.py
 and app/ui.py. Skip/replace with the smaller 1.7B or IQ4_XS quant if this
 machine is tight on RAM, but then update LEGAL_MODEL in both files too.)
-6. Get the MADLAD-400 model onto the new machine:
-
-If you copied BOTH models/madlad400-ct2/ AND models/madlad400-tokenizer/ already → skip this step entirely.
-If not:
-
-powershellpython scripts\convert_translation_model.py
-7. Build the Canon AI vector store (needs internet once, for chromadb + scraping):
+ollama pull bge-m3
+(Embedding model for the Attorney tabs' hybrid retrieval -- app/legal_pipeline_v2.py.
+MUST match the model scripts/embed_local_law_pdfs_bgem3.py used to build the
+'israeli_legal_db' collection.)
+6. Build the Canon AI vector store (needs internet once, for chromadb + scraping):
 
 If you copied app\chroma_db\ already → skip this step entirely.
 If not:
@@ -38,9 +39,9 @@ If not:
 powershellpip install chromadb
 python scripts\scrape_cic_it.py
 python scripts\embed_to_chroma.py
-8. Run it, same as before:
+7. Run it, same as before:
 powershelluvicorn app.main:app --host 0.0.0.0 --port 8000
 new tab:
 powershell.\.venv\Scripts\Activate.ps1
 python -m app.ui
-Steps 2–3 and 5–7 are the only genuinely new work — everything else is identical to first-time setup, just faster since you're not troubleshooting from scratch this time.
+Steps 2–3 and 5–6 are the only genuinely new work — everything else is identical to first-time setup, just faster since you're not troubleshooting from scratch this time.

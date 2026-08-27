@@ -1,12 +1,22 @@
 # Offline Translator + Document OCR System
 
-Windows / 32GB RAM / 16GB shared-memory GPU. Ollama for orchestration,
-MADLAD-400 (CTranslate2) for translation, Docling for document conversion + OCR.
+Windows / 32GB RAM / 16GB shared-memory GPU. Ollama for orchestration and
+LLM inference (chat, document rewrite, and document translation), Docling
+for document conversion + OCR.
+
+Document translation is handled by the Chat tab via two sequential
+`qwen2.5:32b` calls per chunk (clean up OCR/PDF extraction artifacts, then
+translate) rather than a dedicated machine-translation model — just ask the
+Chat tab to translate an attached document into whatever language you want,
+in plain language ("translate this to Spanish"). This project originally
+used a dedicated offline MT engine (NLLB-200, then MADLAD-400 after
+NLLB-200 turned out to be CC-BY-NC 4.0 and unusable commercially) for
+translation; that whole pipeline (`app/translate.py`, the MADLAD-400
+CTranslate2 model, the dedicated Translate tab) has since been removed in
+favor of this simpler LLM-based approach.
 
 All components are commercially licensed (Apache 2.0 / MIT) — safe to use in
-a product you sell. This project originally used NLLB-200 for translation,
-but NLLB-200 is CC-BY-NC 4.0 (non-commercial only, per Meta's model card) and
-was replaced with MADLAD-400 (Google Research, Apache 2.0) for that reason.
+a product you sell.
 
 ## OCR: two engines, deliberately
 
@@ -27,15 +37,13 @@ offline-ai-system/
 ├── requirements.txt             # pinned Python deps
 ├── setup.ps1                    # one-time installer (run once, needs internet)
 ├── run.ps1 / start.bat          # start all services after setup is done
-├── scripts/
-│   └── convert_translation_model.py  # downloads + quantizes MADLAD-400 (run by setup.ps1)
-├── models/
-│   └── madlad400-ct2/           # created by setup.ps1, fully offline after
 └── app/
     ├── document.py               # Docling: convert + OCR (RapidOCR default, Tesseract for Hebrew) -> markdown, docx export
-    ├── translate.py               # MADLAD-400 via CTranslate2
+    ├── legal_pipeline_v2.py       # DictaLM-only RAG pipeline backing the Attorney tabs
     ├── main.py                    # FastAPI orchestrator
-    └── ui.py                      # Gradio front end (Translate / Convert / Chat / Accountant / Legal)
+    └── ui.py                      # Gradio front end (Chat, Convert to Word, Accountant,
+                                    # Attorney 32B / Attorney 32B Instruct (Slower) / Attorney 1.7B (Fast),
+                                    # Canon AI, GDPR AI, HIPAA AI)
 ```
 
 ## One-time setup
@@ -45,19 +53,15 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setup.ps1
 ```
 This installs Python 3.11, Ollama, pandoc, Tesseract, creates a venv,
-installs pinned packages, pulls the Ollama models (qwen2.5, and DictaLM for
-the Legal tab), and downloads + quantizes MADLAD-400 to CTranslate2 format.
-Needs internet.
+installs pinned packages, and pulls the Ollama models (`gpt-oss:20b` for
+invoice classification/PowerPoint outlines, `qwen2.5:32b` for the Chat tab's
+chat/rewrite/translation, `bge-m3` for the Attorney tabs' retrieval, and
+DictaLM for the Legal/Attorney tabs). Needs internet.
 
 **If you'll process any Hebrew documents**, re-run the Tesseract installer
 after setup finishes and tick "Hebrew" on the language selection page — this
 is required, not optional, since Tesseract is the only OCR engine here that
 supports Hebrew script. See the warning setup.ps1 prints for details.
-
-MADLAD-400-3B is a larger model than the NLLB-1.3B this project used before,
-so the download and conversion step will take longer — there's no smaller
-official MADLAD-400 checkpoint, and that size is the tradeoff for a
-commercially licensed model.
 
 After this finishes, check `requirements.lock.txt` for the exact,
 reproducible set of package versions actually installed on your machine.
@@ -92,49 +96,50 @@ From this point, no network access is needed at all.
 
 ## Notes / things worth knowing
 
-- **The 9 languages** (8 + Hebrew) are set in `app/translate.py` as a
-  `LANGUAGES` dict mapping friendly names to MADLAD-400's language codes
-  (mostly plain ISO 639-1, e.g. `en`, `fr`, `ar`, `zh`, `he`). MADLAD-400
-  covers 400+ languages, so almost anything you pick will already be
-  supported — edit the dict to match your actual needs.
-- **MADLAD-400 only needs a target-language tag** — it infers the source
-  language automatically. The source-language dropdown in the UI is kept
-  for clarity but isn't strictly required by the model itself.
+- **Document translation is a Chat tab request, not a separate tab.** Attach
+  a document and ask the Chat tab to "translate this to [language]" — no
+  fixed language list, just say what you want in plain language and the
+  model (`qwen2.5:32b`) figures out the target language from your request.
+  Internally this runs two sequential LLM calls per chunk: Job 1 cleans up
+  OCR/PDF-extraction line breaks and typos *without* translating, Job 2
+  translates the cleaned text. See `translate_document_via_llm` and
+  `CHAT_MODEL` / `TRANSLATE_MODEL` in `app/ui.py`.
 - **Every tab that touches OCR has a "Document is in Hebrew" checkbox** —
-  Translate, Convert to Word, Chat (as an extra option below the chat box),
-  Accountant, and Legal. Leave it unchecked for everything else; it routes
+  Convert to Word, Chat (as an extra option below the chat box), Accountant,
+  and the Attorney tabs. Leave it unchecked for everything else; it routes
   that specific request through Tesseract instead of the default RapidOCR
   engine.
 - **The Accountant tab's Hebrew checkbox applies to the whole batch** — if a
   single ZIP mixes Hebrew and non-Hebrew invoices, process them in two
   separate batches for best accuracy on each.
-- **Ollama's role is intentionally limited to non-translation work**
-  (summarizing, cleaning up OCR'd structure, answering questions about a
-  document, classifying invoices, the Legal tab). Don't ask it to also
-  translate — a dedicated MT model outperforms a general-purpose LLM at
-  translation.
-- **First run of `translate.py`** downloads MADLAD-400's tokenizer config
-  (small) from Hugging Face and caches it — this happens once, triggered
-  from `convert_translation_model.py` during setup, not at request time.
-- **Legal tab** chats with `hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M`
-  via Ollama (pulled by `setup.ps1`), instead of the default qwen2.5 model
-  used everywhere else. It supports the same document-attach + Hebrew-OCR
-  behavior as the Chat tab. Being a "thinking" model, it wraps its
-  reasoning in `<think>...</think>` before the actual answer — the backend
-  (`app/main.py`'s `/chat` endpoint) strips that out before it reaches the
-  UI, so only the final answer is shown.
-- **Hebrew-source translation reliability fix**: chunks of Hebrew text used
-  to be sent to MADLAD-400 far larger than the intended 400-char limit,
-  because the sentence-boundary regex used for chunking only recognized a
-  new sentence when followed by a Latin capital letter or digit — never a
-  Hebrew (or Arabic/Cyrillic/CJK) letter. That silently defeated both the
-  chunker and the sentence-level retry fallback for any non-Latin source
-  script, and MADLAD-400-3B is known to be far less reliable on long,
-  multi-sentence blocks. `app/document.py`'s `SENTENCE_SPLIT_RE` now
-  recognizes these scripts too, and `chunk_text` has a hard character-count
-  fallback (`_hard_split`) so no chunk can silently exceed the limit
-  regardless of script. Hebrew OCR text also had invisible Unicode
-  bidi-direction marks (inserted by Tesseract to keep mixed Hebrew/English
-  text in correct reading order) landing mid-word, which fragmented
-  tokenization further — `strip_bidi_controls` removes these both at
-  Hebrew-OCR extraction time and defensively right before translation.
+- **`qwen2.5:32b` backs the Chat tab specifically** (chat, document rewrite,
+  and document translation) — chosen over the general `gpt-oss:20b` default
+  (still used elsewhere: invoice classification, PowerPoint outlines) for
+  its stronger multilingual output; `gpt-oss:20b` is primarily
+  English-optimized and more prone to drifting back into English on
+  non-English text.
+- **Attorney tabs** (`Attorney 32B`, `Attorney 32B Instruct (Slower)`,
+  `Attorney 1.7B (Fast)`) chat with DictaLM
+  (`hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M` for the first two,
+  a smaller 1.7B variant for the fast one) instead of the Chat tab's
+  `qwen2.5:32b`. Every stage of the two DictaLM-backed pipelines — query
+  understanding, answering, and verification — runs on DictaLM; there's no
+  separate reasoning model involved. See `app/legal_pipeline_v2.py`'s module
+  docstring for the full architecture of each tab. Being a "thinking"
+  model, DictaLM wraps its reasoning in `<think>...</think>` before the
+  actual answer, which is stripped before it reaches the UI either way.
+- **Document-chunking reliability fix**: chunks of Hebrew text used to be
+  sent to downstream LLM calls (translation, document rewrite, RAG
+  ingestion) far larger than the intended per-chunk limit, because the
+  sentence-boundary regex used for chunking only recognized a new sentence
+  when followed by a Latin capital letter or digit — never a Hebrew (or
+  Arabic/Cyrillic/CJK) letter. That silently defeated chunking for any
+  non-Latin source script, and long, multi-sentence blocks are less
+  reliable for most local models regardless of task. `app/document.py`'s
+  `SENTENCE_SPLIT_RE` now recognizes these scripts too, and `chunk_text` has
+  a hard character-count fallback (`_hard_split`) so no chunk can silently
+  exceed the limit regardless of script. Hebrew OCR text also had invisible
+  Unicode bidi-direction marks (inserted by Tesseract to keep mixed
+  Hebrew/English text in correct reading order) landing mid-word, which
+  fragmented tokenization further — `strip_bidi_controls` removes these at
+  Hebrew-OCR extraction time.

@@ -1,8 +1,13 @@
 """
 FastAPI orchestrator.
 
-Pipeline: upload -> Docling (convert+OCR) -> language detect -> NLLB translate
-          -> optional Ollama cleanup/summarization -> return / export docx
+Pipeline: upload -> Docling (convert+OCR) -> optional Ollama chat/rewrite/
+          translate -> return / export docx
+
+Document translation is now handled entirely by app/ui.py's Chat tab (two
+sequential Ollama chat calls per chunk -- clean, then translate), not by
+this backend. There is no dedicated translation model or endpoint here
+anymore -- see app/ui.py's translate_document_via_llm for the actual flow.
 """
 import json
 import re
@@ -19,34 +24,16 @@ from fastapi.responses import JSONResponse, FileResponse
 
 from app.document import (
     convert_to_markdown,
-    chunk_text,
     convert_file_to_docx,
     resolve_hebrew_flag,
     TesseractNotAvailableError,
     OCRProducedNoTextError,
 )
-from app.translate import get_translator, LANGUAGES
 from app.pptx_generator import generate_pptx
 
 app = FastAPI(title="Offline Translator + Document OCR")
 
 OLLAMA_MODEL = "gpt-oss:20b"
-
-# Backs ONLY the Translate tab's optional "Also summarize with AI" step
-# (see /translate-document below) -- deliberately kept separate from the
-# general OLLAMA_MODEL default above, which now points at gpt-oss:20b for
-# Chat/Canon AI/invoice classification/pptx outlines. qwen2.5-instruct is
-# explicitly trained and marketed for strong multilingual generation across
-# this app's translation targets (French/Spanish/Italian/German/Arabic/
-# Chinese/Russian/Hebrew); gpt-oss:20b is primarily English-optimized and
-# is more prone to drifting back into English on a non-English summary
-# despite the "Respond ONLY in {target_lang}" system-prompt instruction --
-# exactly the kind of target-language failure translate.py's own
-# _wrong_language() check exists to catch on the MADLAD-400 side, but which
-# the Ollama-based summary step below has no equivalent safety net for.
-# Pulled the same way as OLLAMA_MODEL -- see setup.ps1/setup_mac.sh/
-# install.txt (`ollama pull qwen2.5:7b-instruct-q4_K_M`).
-TRANSLATE_SUMMARY_MODEL = "qwen2.5:7b-instruct-q4_K_M"
 
 # Backs the Legal tab. Must be pulled once via:
 #   ollama pull hf.co/dicta-il/DictaLM-3.0-24B-Thinking-GGUF:Q4_K_M
@@ -182,7 +169,7 @@ def _convert_to_markdown_or_503(path: str, hebrew: bool) -> str:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "languages": list(LANGUAGES.keys())}
+    return {"status": "ok"}
 
 
 @app.post("/detect-language")
@@ -369,70 +356,3 @@ async def convert_to_word(file: UploadFile = File(...), hebrew: bool = Form(Fals
         filename=output_filename,
         headers={"X-Hebrew-OCR-Used": str(hebrew_used)},
     )
-
-
-@app.post("/translate-chunk")
-async def translate_chunk(payload: dict):
-    """Translates a single chunk of text. Used by the UI to show per-chunk progress."""
-    text = payload.get("text", "")
-    source_lang = payload.get("source_lang")
-    target_lang = payload.get("target_lang")
-    translator = get_translator()
-    translated, ok = translator.translate(text, source_lang, target_lang)
-    return {"translated": translated, "ok": ok}
-
-
-@app.post("/translate-document")
-async def translate_document(
-    file: UploadFile = File(...),
-    source_lang: str = Form(...),
-    target_lang: str = Form(...),
-    summarize: bool = Form(False),
-    hebrew: bool = Form(False),
-):
-    # 1. Save upload
-    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-
-    # 2. Convert + OCR
-    hebrew_used = resolve_hebrew_flag(tmp_path, hebrew)
-    markdown_text = _convert_to_markdown_or_503(tmp_path, hebrew_used)
-    chunks = chunk_text(markdown_text)
-
-    # 3. Translate each chunk
-    translator = get_translator()
-    results = translator.translate_chunks(chunks, source_lang, target_lang)
-    translated_chunks = [text for text, _ok in results]
-    failed_chunks = sum(1 for _text, ok in results if not ok)
-    translated_text = "\n\n".join(translated_chunks)
-
-    # 4. Optional: Ollama pass to clean up structure / summarize
-    # Uses TRANSLATE_SUMMARY_MODEL (qwen2.5), not the general OLLAMA_MODEL
-    # (gpt-oss) -- see that constant's comment above for why.
-    summary = None
-    if summarize:
-        response = _ollama_client.chat(
-            model=TRANSLATE_SUMMARY_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        f"You are a precise document summarizer. Respond ONLY in "
-                        f"{target_lang}, matching the language of the text you are "
-                        f"given -- never switch to a different language."
-                    ),
-                },
-                {"role": "user", "content": f"Summarize this in 3-5 bullet points:\n\n{translated_text}"},
-            ],
-        )
-        summary = response["message"]["content"]
-
-    return JSONResponse({
-        "original_markdown": markdown_text,
-        "translated_text": translated_text,
-        "summary": summary,
-        "total_chunks": len(chunks),
-        "failed_chunks": failed_chunks,
-        "hebrew_used": hebrew_used,
-    })
